@@ -3,7 +3,7 @@ Source code for **MIOSTONE: Modeling microbiome-trait associations with taxonomy
 
 ## Dataset
 
-Access the dataset used in **MIOSTONE** here: [https://drive.google.com/file/d/13A5OPZjv6DRPpjChz8MaKXcAEqG-CPeF/view?usp=sharing](#). Please download the file and unzip it in the root directory of the project.
+Access the datasets used in **MIOSTONE** here: [Link to datasets](https://drive.google.com/file/d/13A5OPZjv6DRPpjChz8MaKXcAEqG-CPeF/view?usp=sharing). Please download the file and unzip it in the root directory of the project.
 
 ## Example Notebook
 
