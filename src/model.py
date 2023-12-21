@@ -4,6 +4,24 @@ from captum.module import (BinaryConcreteStochasticGates,
                            GaussianStochasticGates)
 
 
+class MLPModel(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.out_features = out_features
+        self.fc1 = nn.Linear(in_features, in_features // 2)
+        self.fc2 = nn.Linear(in_features // 2, in_features // 4)
+        self.fc3 = nn.Linear(in_features // 4, out_features)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.relu(self.fc1(x))
+        out = self.relu(self.fc2(out))
+        out = self.fc3(out)
+        return out
+    
+    def get_total_l0_reg(self):
+        return torch.tensor(0.0).to(self.fc1.weight.device)
+
 class DeterministicGate(nn.Module):
     def __init__(self, values):
         super().__init__()
@@ -16,23 +34,21 @@ class DeterministicGate(nn.Module):
         return self.values
 
 class TreeNode(nn.Module):
-    def __init__(self, name, device,
-                 input_dim, output_dim, 
-                 gate_type, gate_param):
+    def __init__(self, name, in_features, out_features, gate_type, gate_param):
         super().__init__()
         self.name = name
-        self.input_dim = input_dim
-        self.output_dim = output_dim
+        self.in_features = in_features
+        self.out_features = out_features
 
-        self.mlp_embedding_layer = nn.Sequential(nn.Linear(self.input_dim, self.output_dim), nn.ReLU())
-        self.linear_embedding_layer = nn.Linear(self.input_dim, self.output_dim)
+        self.mlp_embedding_layer = nn.Sequential(nn.Linear(self.in_features, self.out_features), nn.ReLU())
+        self.linear_embedding_layer = nn.Linear(self.in_features, self.out_features)
 
         if gate_type == 'gaussian':
-            self.gate = GaussianStochasticGates(n_gates=1, mask=torch.tensor([0]).to(device), std=gate_param)
+            self.gate = GaussianStochasticGates(n_gates=1, mask=torch.tensor([0]), temperature=gate_param)
         elif gate_type == 'concrete':
-            self.gate = BinaryConcreteStochasticGates(n_gates=1, mask=torch.tensor([0]).to(device), temperature=gate_param)
+            self.gate = BinaryConcreteStochasticGates(n_gates=1, mask=torch.tensor([0]), temperature=gate_param)
         elif gate_type == 'deterministic':
-            self.gate = DeterministicGate(torch.tensor(gate_param).to(device))
+            self.gate = DeterministicGate(torch.tensor(gate_param))
         else:
             raise ValueError(f"Invalid gate type: {gate_type}")
 
@@ -57,104 +73,84 @@ class TreeNode(nn.Module):
     def get_l0_reg(self):
         return self.l0_reg
 
-        
-class TreeNN(nn.Module):
-    def __init__(self, device, ete_tree, node_min_dim, 
-                 node_dim_func, node_dim_func_param,
-                 node_gate_type, node_gate_param, 
-                 output_dim, output_depth, output_truncation):
+class TreeModel(nn.Module):
+    def __init__(self, 
+                 tree,
+                 out_features,
+                 node_min_dim=1, 
+                 node_dim_func='linear',
+                 node_dim_func_param=0.95, 
+                 node_gate_type='concrete',
+                 node_gate_param=0.1):
         super().__init__()
-        self.device = device
-        self.ete_tree = ete_tree
+        self.tree = tree
+        self.out_features = out_features
         self.node_min_dim = node_min_dim
         self.node_dim_func = node_dim_func
         self.node_dim_func_param = node_dim_func_param
         self.node_gate_type = node_gate_type
         self.node_gate_param = node_gate_param
-        self.output_dim = output_dim
-        self.output_depth = output_depth
-        self.output_truncation = output_truncation
-        self.outputs = {}
-        self._build_network()
-        self._init_weights()
-        self.to(device)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        # Build the network based on the ETE Tree
+        self._build_network()
 
     def _build_network(self):
         self.nodes = nn.ModuleDict()
-        self.output_nodes = []
         self.embedding_nodes = [] 
 
         # Define the node dimension function
         def dim_func(x, node_dim_func, node_dim_func_param, depth):
             if node_dim_func == "linear":
-                max_depth = self.ete_tree.max_depth
-                coeff = node_dim_func_param ** (max_depth - depth)
+                coeff = node_dim_func_param ** (self.tree.max_depth - depth)
                 return int(coeff * x)
             elif node_dim_func == "const":
                 return int(node_dim_func_param)
         
         # Iterate over nodes in ETE Tree and build TreeNode
-        for ete_node in reversed(list(self.ete_tree.traverse("levelorder"))):
-            if ete_node.depth >= self.output_depth or not self.output_truncation:
-                # Set the input dimensions
-                children_out_dims = [self.nodes[child.name].output_dim for child in ete_node.get_children()] if not ete_node.is_leaf() else [1]
-                node_in_dim = sum(children_out_dims)
+        for ete_node in reversed(list(self.tree.ete_tree.traverse("levelorder"))):
+            # Set the input dimensions
+            children_out_dims = [self.nodes[child.name].out_features for child in ete_node.get_children()] if not ete_node.is_leaf else [1]
+            node_in_dim = sum(children_out_dims)
 
-                # Set the output dimensions
-                node_out_dim = max(self.node_min_dim, dim_func(len(ete_node.get_leaves()), self.node_dim_func, self.node_dim_func_param, ete_node.depth))
+            # Set the out dimensions
+            node_out_dim = max(self.node_min_dim, dim_func(len(list(ete_node.leaves())), self.node_dim_func, self.node_dim_func_param, self.tree.depths[ete_node.name]))
 
-                # Build the node
-                tree_node = TreeNode(ete_node.name, self.device, 
-                                     node_in_dim, node_out_dim, 
-                                     self.node_gate_type, self.node_gate_param)
-                self.nodes[ete_node.name] = tree_node
-                
-                # Add the node to the output nodes if necessary
-                if ete_node.depth <= self.output_depth:
-                    self.output_nodes.append(ete_node.name)
+            # Build the node
+            tree_node = TreeNode(ete_node.name,node_in_dim, node_out_dim, self.node_gate_type, self.node_gate_param)
+            self.nodes[ete_node.name] = tree_node
 
-        # Build output layer
-        output_in_dim = sum([self.nodes[output_node].output_dim for output_node in self.output_nodes])
-        self.output_layer = nn.Sequential(nn.BatchNorm1d(output_in_dim), nn.Linear(output_in_dim, self.output_dim))
+        # Build out layer
+        out_in_dim = self.nodes[self.tree.ete_tree.name].out_features
+        self.out_layer = nn.Sequential(nn.BatchNorm1d(out_in_dim), nn.Linear(out_in_dim, self.out_features))
 
     def forward(self, x):
         # Initialize a dictionary to store the outputs at each node
         self.outputs = {}
-        self.total_l0_reg = torch.tensor(0.0).to(self.device)
+        self.total_l0_reg = torch.tensor(0.0).to(x.device)
 
         # Perform a forward pass on the leaves
         input_split = torch.split(x, split_size_or_sections=1, dim=1)
-        for leaf_node, input in zip(self.ete_tree.get_leaves(), input_split):
+        for leaf_node, input in zip(self.tree.ete_tree.leaves(), input_split):
             embedding_mlp = self.nodes[leaf_node.name](input, input)
             embedding_linear = self.nodes[leaf_node.name].get_node_embedding_linear()
             self.outputs[leaf_node.name] = (embedding_mlp, embedding_linear)
             self.total_l0_reg += self.nodes[leaf_node.name].get_l0_reg()
             
         # Perform a forward pass on the internal nodes in "topological order"
-        for ete_node in reversed(list(self.ete_tree.traverse("levelorder"))):
-            if not ete_node.is_leaf() and (ete_node.depth >= self.output_depth or not self.output_truncation):
+        for ete_node in reversed(list(self.tree.ete_tree.traverse("levelorder"))):
+            if not ete_node.is_leaf:
                 children_outputs = [self.outputs[child.name] for child in ete_node.get_children()]
-                children_embeddings_mlp = torch.cat([output[0] for output in children_outputs], dim=1)
-                children_embeddings_linear = torch.cat([output[1] for output in children_outputs], dim=1)
+                children_embeddings_mlp = torch.cat([out[0] for out in children_outputs], dim=1)
+                children_embeddings_linear = torch.cat([out[1] for out in children_outputs], dim=1)
                 embedding_mlp = self.nodes[ete_node.name](children_embeddings_mlp, children_embeddings_linear)
                 embedding_linear = self.nodes[ete_node.name].get_node_embedding_linear()
                 self.outputs[ete_node.name] = (embedding_mlp, embedding_linear)
                 self.total_l0_reg += self.nodes[ete_node.name].get_l0_reg()
-    
-        # Concatenate the outputs of the output nodes
-        self.embedding = torch.cat([self.outputs[output_node][0] for output_node in self.output_nodes], dim=1)
 
-        # Pass the tree output through the final output layer
-        preds = self.output_layer(self.embedding)
+        # Pass the tree out through the final out layer
+        logits = self.out_layer(self.outputs[self.tree.ete_tree.name][0])
 
-        return preds
+        return logits
     
     def get_total_l0_reg(self):
         return self.total_l0_reg
