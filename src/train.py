@@ -4,9 +4,11 @@ import pickle
 from datetime import datetime
 
 import numpy as np
-import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+from lightning.fabric.utilities.seed import seed_everything
+from lightning.pytorch import LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.callbacks import Timer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader
@@ -15,29 +17,34 @@ from torchmetrics.classification import (MulticlassAccuracy, MulticlassAUROC,
                                          MulticlassAveragePrecision)
 
 from data import MIOSTONEDataset, MIOSTONEMixup
-from model import MLPModel, TreeModel
+from model import MLP, MIOSTONEModel, PopPhyCNN, TaxoNN
 from pipeline import Pipeline
 
 
-class MIOSTONEDataModule(pl.LightningDataModule):
-    def __init__(self, train_dataset, test_dataset, batch_size=32, num_workers=4):  
+class DataModule(LightningDataModule):
+    def __init__(self, train_dataset, val_dataset, test_dataset, batch_size, num_workers):  
         super().__init__()
         self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
         self.test_dataset = test_dataset
         self.batch_size = batch_size
         self.num_workers = num_workers 
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+    
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
     
-class MIOSTONEClassifier(pl.LightningModule):
+class Classifier(LightningModule):
     def __init__(self, model, class_weight):
         super().__init__()
         self.model = model
-        self.criterion = nn.CrossEntropyLoss(weight=class_weight)
+        self.train_criterion = nn.CrossEntropyLoss(weight=class_weight)
+        self.val_criterion = nn.CrossEntropyLoss()
         self.test_true_labels = []
         self.test_logits = []
         
@@ -47,10 +54,20 @@ class MIOSTONEClassifier(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         X, y = batch
         logits = self.model(X)
-        loss = self.criterion(logits, y)
+        loss = self.train_criterion(logits, y)
         l0_reg = self.model.get_total_l0_reg()
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_l0_reg', l0_reg, on_step=True, on_epoch=True, prog_bar=True)
+
+        return loss + l0_reg
+    
+    def validation_step(self, batch, batch_idx):
+        X, y = batch
+        logits = self.model(X)
+        loss = self.val_criterion(logits, y)
+        l0_reg = self.model.get_total_l0_reg()
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('val_l0_reg', l0_reg, on_step=True, on_epoch=True, prog_bar=True)
 
         return loss + l0_reg
 
@@ -79,11 +96,12 @@ class TrainingPipeline(Pipeline):
         self.train_hparams = {}
         self.mixup_hparams = {}
 
-    def _create_subset(self, indices, one_hot_encoding=True, clr=True):
-        X_subset = self.dataset.X[indices]
-        y_subset = self.dataset.y[indices]
-        subset = MIOSTONEDataset(X_subset, y_subset, self.dataset.features)
-        subset.normalize()
+    def _create_subset(self, indices, normalize=True, one_hot_encoding=True, clr=True):
+        X_subset = self.data.X[indices]
+        y_subset = self.data.y[indices]
+        subset = MIOSTONEDataset(X_subset, y_subset, self.data.features)
+        if normalize:
+            subset.normalize()
         if one_hot_encoding:
             subset.one_hot_encode()
         if clr:
@@ -98,16 +116,26 @@ class TrainingPipeline(Pipeline):
     
         return augmented_dataset
 
-    def _create_classifier(self, in_features, out_features, class_weight):
+    def _create_classifier(self, train_dataset):
+        in_features = train_dataset.X.shape[1]
+        out_features = train_dataset.num_classes
+        class_weight = train_dataset.class_weight if self.train_hparams['class_weight'] == 'balanced' else None
+
+        if class_weight is None:
+            class_weight = [1] * out_features
         if self.model_type == 'rf':
             class_weight = {key: value for key, value in enumerate(class_weight)}
-            classifier = RandomForestClassifier(class_weight=class_weight, **self.model_hparams)
+            classifier = RandomForestClassifier(class_weight=class_weight, random_state=self.seed, **self.model_hparams)
         else:
             class_weight = torch.tensor(class_weight).float()
             if self.model_type == 'mlp':
-                classifier = MIOSTONEClassifier(MLPModel(in_features, out_features, **self.model_hparams), class_weight)
-            elif self.model_type == 'tree':
-                classifier = MIOSTONEClassifier(TreeModel(tree=self.tree, out_features=out_features, **self.model_hparams), class_weight)
+                classifier = Classifier(MLP(in_features, out_features, **self.model_hparams), class_weight)
+            elif self.model_type == 'taxonn':
+                classifier = Classifier(TaxoNN(self.tree, out_features, train_dataset, **self.model_hparams), class_weight)
+            elif self.model_type == 'popphycnn':
+                classifier = Classifier(PopPhyCNN(self.tree, out_features, **self.model_hparams), class_weight)
+            elif self.model_type == 'miostone':
+                classifier = Classifier(MIOSTONEModel(self.tree, out_features, **self.model_hparams), class_weight)
             else:
                 raise ValueError(f"Invalid model type: {self.model_type}")
 
@@ -118,30 +146,33 @@ class TrainingPipeline(Pipeline):
             classifier.fit(train_dataset.X, train_dataset.y)
             test_true_labels = torch.tensor(test_dataset.y)
             test_logits = torch.tensor(classifier.predict_proba(test_dataset.X))
+            time_elapsed = 0
         else:
-            data_module = MIOSTONEDataModule(train_dataset, test_dataset, batch_size=self.train_hparams['batch_size'])
-            trainer = pl.Trainer(max_epochs=self.train_hparams['max_epochs'],
-                                enable_progress_bar=True, 
-                                enable_model_summary=False,
-                                enable_checkpointing=False,
-                                log_every_n_steps=1)
+            data_module = DataModule(train_dataset, test_dataset, test_dataset, batch_size=self.train_hparams['batch_size'], num_workers=1)
+            timer = Timer()
+            trainer = Trainer(max_epochs=self.train_hparams['max_epochs'],
+                              enable_progress_bar=True, 
+                              enable_model_summary=False,
+                              enable_checkpointing=False,
+                              log_every_n_steps=1,
+                              callbacks=[timer],
+                              accelerator='gpu')
             trainer.fit(classifier, datamodule=data_module)
             trainer.test(classifier, datamodule=data_module)
             test_true_labels, test_logits = classifier.get_test_results()
+            time_elapsed = timer.time_elapsed('train')
 
-        return test_true_labels, test_logits
+        return test_true_labels, test_logits, time_elapsed
     
-    def _save_model(self, classifier):
+    def _save_model(self, classifier, filename):
         models_dir = self.output_dir + 'models/'
-        filename = f'model_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
         if self.model_type == 'rf':
             pickle.dump(classifier, open(models_dir + filename + '.pkl', 'wb'))
         else:
             torch.save(classifier.model.state_dict(), models_dir + filename + '.pt')
     
-    def _save_result(self, result):
+    def _save_result(self, result, filename):
         results_dir = self.output_dir + 'results/'
-        filename = f'result_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
         with open(results_dir + filename, 'w') as f:
             json.dump(result, f, indent=4)
 
@@ -175,11 +206,11 @@ class TrainingPipeline(Pipeline):
 
     def _train(self):
         # Check if data and tree are loaded
-        if not self.dataset or not self.tree:
+        if not self.data or not self.tree:
             raise ValueError('Please load data and tree first.')
         
         # Define metrics
-        num_classes = len(np.unique(self.dataset.y))
+        num_classes = len(np.unique(self.data.y))
         metrics = MetricCollection({
             'Accuracy': MulticlassAccuracy(num_classes=num_classes),
             'AUROC': MulticlassAUROC(num_classes=num_classes),
@@ -187,50 +218,56 @@ class TrainingPipeline(Pipeline):
         })
         
         # Define cross-validation strategy
-        skf = StratifiedKFold(n_splits=self.train_hparams['k_folds'], shuffle=True)
+        skf = StratifiedKFold(n_splits=self.train_hparams['k_folds'], shuffle=True, random_state=self.seed)
 
         # Training loop
         overall_test_true_labels = []
         overall_test_logits = []
-        for fold, (train_index, test_index) in enumerate(skf.split(self.dataset.X, self.dataset.y)):
+        for fold, (train_index, test_index) in enumerate(skf.split(self.data.X, self.data.y)):
             # Reset the seed for reproducibility
-            pl.seed_everything(self.seed)
+            seed_everything(self.seed)
 
             # Prepare datasets
-            if self.mixup_hparams:
-                train_dataset = self._create_subset(train_index, clr=False)
-            else:
-                train_dataset = self._create_subset(train_index, one_hot_encoding=False)
-            test_dataset = self._create_subset(test_index, one_hot_encoding=False)
+            normalize = False if self.model_type == 'popphycnn' else True
+            one_hot_encoding = True if self.mixup_hparams else False
+            clr = False if self.model_type == 'popphycnn' else True
+            train_dataset = self._create_subset(train_index, normalize=normalize, one_hot_encoding=one_hot_encoding, clr=clr)
+            test_dataset = self._create_subset(test_index, normalize=normalize, one_hot_encoding=False, clr=clr)
 
             # Apply MIOSTONEMixup if specified
             if self.mixup_hparams:
                 train_dataset = self._apply_mixup(train_dataset)
 
             # Create classifier 
-            in_features = self.dataset.X.shape[1]
-            out_features = self.dataset.num_classes
-            classifier = self._create_classifier(in_features, out_features, train_dataset.class_weight)
+            classifier = self._create_classifier(train_dataset)
+
+            # Convert the datasets to tree matrices if necessary
+            if self.model_type == 'popphycnn':
+                scaler = train_dataset.to_tree_matrix(self.tree)
+                test_dataset.to_tree_matrix(self.tree, scaler=scaler)
 
             # Run training
-            test_true_labels, test_logits = self._run_training(classifier, train_dataset, test_dataset)
+            test_true_labels, test_logits, time_elapsed = self._run_training(classifier, train_dataset, test_dataset)
+            overall_test_true_labels.append(test_true_labels)
+            overall_test_logits.append(test_logits)
 
             # Save test results
             result = {
+                'Seed': self.seed,
                 'Fold': fold,
                 'Model Type': self.model_type,
                 'Model Hparams': self.model_hparams,
                 'Train Hparams': self.train_hparams,
                 'Mixup Hparams': self.mixup_hparams,
                 'True Labels': test_true_labels.numpy().tolist(), 
-                'Logits': test_logits.numpy().tolist()
+                'Logits': test_logits.numpy().tolist(),
+                'Time Elapsed': time_elapsed,
             }
-            self._save_result(result)
-            overall_test_true_labels.append(test_true_labels)
-            overall_test_logits.append(test_logits)
 
-            # Save model
-            self._save_model(classifier)
+            # Save results and model
+            filename = f"{self.seed}_{fold}_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            self._save_result(result, filename)
+            # self._save_model(classifier, filename)
 
         # Compute CV scores
         self._compute_mean_std_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
@@ -243,17 +280,26 @@ class TrainingPipeline(Pipeline):
 
         # Configure default model parameters
         self.model_type = model_type
-        if self.model_type == 'tree':
+        if self.model_type == 'miostone':
             self.model_hparams['node_min_dim'] = 1
             self.model_hparams['node_dim_func'] = 'linear'
-            self.model_hparams['node_dim_func_param'] = 0.95
+            self.model_hparams['node_dim_func_param'] = 0.7
             self.model_hparams['node_gate_type'] = 'concrete'
-            self.model_hparams['node_gate_param'] = 0.1
+            self.model_hparams['node_gate_param'] = 0.3
+        elif self.model_type == 'popphycnn':
+            self.model_hparams['num_kernel'] = 32
+            self.model_hparams['kernel_height'] = 10
+            self.model_hparams['kernel_width'] = 3
+            self.model_hparams['num_fc_nodes'] = 32
+            self.model_hparams['num_cnn_layers'] = 1
+            self.model_hparams['num_fc_layers'] = 1
+            self.model_hparams['dropout'] = 0.3
 
         # Configure default training parameters
-        self.train_hparams['k_folds'] = 3
+        self.train_hparams['k_folds'] = 5
         self.train_hparams['batch_size'] = 512
-        self.train_hparams['max_epochs'] = 50
+        self.train_hparams['max_epochs'] = 100
+        self.train_hparams['class_weight'] = 'balanced'
 
         # Configure default mixup parameters
         # self.mixup_hparams['num_samples'] = 100
@@ -271,8 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, required=True, help="Random seed.")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset to use.")
     parser.add_argument("--target", type=str, required=True, help="Target to predict.")
-    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'mlp', 'tree'], help="Model type to use.")
+    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'mlp', 'taxonn', 'popphycnn', 'miostone'], help="Model type to use.")
     args = parser.parse_args()
 
     run_training_pipeline(args.dataset, args.target, args.model_type, args.seed)
-

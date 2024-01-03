@@ -24,7 +24,7 @@ class EmbeddingPipeline(Pipeline):
 
     def _fetch_node_outputs(self, depth):
         self.model.eval()
-        dataloader = DataLoader(self.dataset, batch_size=2048, shuffle=False)
+        dataloader = DataLoader(self.data, batch_size=2048, shuffle=False)
         embeddings = []
 
         for inputs, _ in dataloader:
@@ -46,7 +46,7 @@ class EmbeddingPipeline(Pipeline):
 
     def _plot_embeddings_with_labels(self, X_transformed, labels, title, ax):
         for label in labels:
-            idx = np.where(self.dataset.y == label)
+            idx = np.where(self.data.y == label)
             ax.scatter(*X_transformed[idx].T[:2], label=label, alpha=0.6)
 
         ax.set_xlabel("Component 1")
@@ -56,7 +56,7 @@ class EmbeddingPipeline(Pipeline):
 
     def _visualize_embeddings_across_depths(self, reducer):
         depths = range(1, self.tree.max_depth + 1)
-        labels = np.unique(self.dataset.y)
+        labels = np.unique(self.data.y)
         n_plots = len(depths)
         n_cols, n_rows = (n_plots + 1) // 2, 2
 

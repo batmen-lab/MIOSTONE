@@ -37,15 +37,15 @@ class AttributionPipeline(Pipeline):
             json.dump(self.leaf_attributions, f, indent=4)
 
     def _preprocess_data(self, num_samples):
-        selected_indices = np.random.choice(len(self.dataset), num_samples, replace=False)
-        inputs = self.dataset.X[selected_indices]
-        targets = self.dataset.y[selected_indices]
+        selected_indices = np.random.choice(len(self.data), num_samples, replace=False)
+        inputs = self.data.X[selected_indices]
+        targets = self.data.y[selected_indices]
 
-        selected_indices = np.random.choice(len(self.dataset.y), num_samples, replace=False)
-        inputs_list = self.dataset.X[selected_indices]
-        baselines_list = np.mean(self.dataset.X, axis=0)
+        selected_indices = np.random.choice(len(self.data.y), num_samples, replace=False)
+        inputs_list = self.data.X[selected_indices]
+        baselines_list = np.mean(self.data.X, axis=0)
         baselines_list = np.tile(baselines_list, (num_samples, 1))
-        targets_list = self.dataset.y[selected_indices]
+        targets_list = self.data.y[selected_indices]
 
         inputs = torch.tensor(np.vstack(inputs_list))
         baselines = torch.tensor(np.vstack(baselines_list))
@@ -72,7 +72,7 @@ class AttributionPipeline(Pipeline):
     def _compute_leaf_attributions(self, inputs, baselines, targets):
         attributor = DeepLift(self.model)
         attributions = attributor.attribute(inputs, baselines=baselines, target=targets).detach().cpu().numpy()
-        for i, feature in enumerate(self.dataset.features):
+        for i, feature in enumerate(self.data.features):
             self.leaf_attributions[feature] = np.mean(np.abs(attributions), axis=0)[i].astype(float)
 
         self._normalize_attributions(self.leaf_attributions)
@@ -135,7 +135,7 @@ class AttributionPipeline(Pipeline):
         results_fp = f"{self.output_dir}/results/{model_fn.replace('model', 'result')}.json"
         self._load_model(model_fp, results_fp)
         self._validate_model()
-        num_samples = len(self.dataset) if num_samples is None else num_samples
+        num_samples = len(self.data) if num_samples is None else num_samples
         inputs, baselines, targets = self._preprocess_data(num_samples)
         self._compute_internal_attributions(inputs, baselines, targets, depth)
         self._compute_leaf_attributions(inputs, baselines, targets)

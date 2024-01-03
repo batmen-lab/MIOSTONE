@@ -5,7 +5,9 @@ import random
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset
+
 
 class MIOSTONETree:
     """
@@ -26,19 +28,47 @@ class MIOSTONETree:
         self.ete_tree = ete_tree
         self.depths = {}
         self.max_depth = 0
-        self._compute_depths()
 
-    def _compute_depths(self):
+    def prune(self, features):
         """
-        Compute the depths of all features in the tree. This method is used internally
-        by the __init__ method.
+        Prune the tree to only include the specified features.
+
+        :param features: A list of features to preserve.
+        """
+        leaves = set(self.ete_tree.leaves())
+        while any(leaf.name not in features for leaf in leaves):
+            for leaf in leaves:
+                if leaf.name not in features:
+                    leaf.delete(prevent_nondicotomic=False)
+            leaves = set(self.ete_tree.leaves())
+
+    def compute_depths(self):
+        """
+        Compute the depths of all nodes in the tree.
         """
         for ete_node in self.ete_tree.traverse("levelorder"):
             if ete_node.is_root:
                 self.depths[ete_node.name] = 0
             else:
                 self.depths[ete_node.name] = self.depths[ete_node.up.name] + 1
+            if self.depths[ete_node.name] == 2 and ete_node.is_leaf:
+                print(ete_node.up.up.name)
             self.max_depth = max(self.max_depth, self.depths[ete_node.name])
+
+    def compute_indices(self):
+        """
+        Compute the indices of all nodes in the tree.
+        """
+        self.indices = {}
+        curr_id = 0
+        curr_depth = 0
+        for ete_node in self.ete_tree.traverse("levelorder"):
+            node_depth = self.depths[ete_node.name]
+            if node_depth > curr_depth:
+                curr_id = 0
+                curr_depth = node_depth
+            self.indices[ete_node.name] = curr_id
+            curr_id += 1
 
 
 class MIOSTONEDataset(Dataset):
@@ -71,6 +101,7 @@ class MIOSTONEDataset(Dataset):
         self.normalized = False
         self.clr_transformed = False
         self.one_hot_encoded = False
+        self.tree_matrix_repr = False
 
     def __len__(self):
         """
@@ -136,7 +167,8 @@ class MIOSTONEDataset(Dataset):
         if self.normalized:
             raise ValueError("Dataset is already normalized")
         self.X = self.X + 1 # Add 1 to avoid division by 0
-        self.X = self.X / self.X.sum(axis=1, keepdims=True)
+        self.X_sum = self.X.sum(axis=1, keepdims=True)
+        self.X = self.X / self.X_sum
         self.normalized = True 
     
     def clr_transform(self):
@@ -149,7 +181,8 @@ class MIOSTONEDataset(Dataset):
             raise ValueError("Dataset must be normalized before clr-transformation")
         if self.clr_transformed:
             raise ValueError("Dataset is already clr-transformed")
-        self.X = np.log(self.X) - np.log(self.X.mean(axis=1, keepdims=True))
+        self.X = np.log(self.X)
+        self.X = self.X - self.X.mean(axis=1, keepdims=True)
         self.clr_transformed = True
 
     def one_hot_encode(self):
@@ -234,7 +267,53 @@ class MIOSTONEDataset(Dataset):
         """
         leaf_names = list(tree.ete_tree.leaf_names())
         self.X = self.X[:, [self.features.tolist().index(leaf) for leaf in leaf_names]]
-        self.features = np.array(leaf_names) 
+        self.features = np.array(leaf_names)
+
+    def to_tree_matrix(self, tree, scaler=None):
+        """
+        Convert the dataset to a tree matrix representation. 
+
+        :param tree: A MIOSTONETree instance.
+        :param scaler: A Scaler instance to apply to the matrix. Defaults to None.
+        :return: A Scaler instance used to scale the matrix.
+        :raises ValueError: If the dataset is already in tree matrix representation or is normalized or CLR transformed.
+        """
+        if self.tree_matrix_repr:
+            raise ValueError("Dataset is already in tree matrix representation")
+        if self.normalized:
+            raise ValueError("Dataset must not be normalized before converting to tree matrix representation")
+        if self.clr_transformed:
+            raise ValueError("Dataset must not be clr-transformed before converting to tree matrix representation")
+
+        # Create a matrix with the same shape as the tree
+        num_rows = tree.max_depth + 1
+        num_cols = len(list(tree.ete_tree.leaves()))
+        M = np.zeros((self.X.shape[0], num_rows, num_cols), dtype=np.float32)
+
+        # Iterate over the nodes in the tree in level order and fill in the matrix
+        for ete_node in reversed(list(tree.ete_tree.traverse("levelorder"))):
+            if ete_node.is_leaf:
+                M[:, tree.depths[ete_node.name], tree.indices[ete_node.name]] = self.X[:, tree.indices[ete_node.name]]
+            else:
+                for child in ete_node.get_children():
+                    M[:, tree.depths[ete_node.name], tree.indices[ete_node.name]] += M[:, tree.depths[child.name], tree.indices[child.name]]
+
+        # Apply log transformation
+        M = np.log1p(M)
+
+        # Apply scaling to the matrix
+        if scaler:
+            M = scaler.transform(M.reshape(-1, num_rows * num_cols)).reshape(-1, num_rows, num_cols)
+        else:
+            scaler = MinMaxScaler()
+            M = scaler.fit_transform(M.reshape(-1, num_rows * num_cols)).reshape(-1, num_rows, num_cols)
+        M = np.clip(M, 0, 1)
+
+        self.X = M
+        self.tree_matrix_repr = True
+
+        return scaler
+    
         
 class MIOSTONEMixup:
     """
@@ -253,15 +332,15 @@ class MIOSTONEMixup:
         :param dataset: MIOSTONEDataset instance for the dataset to augment.
         :param tree: MIOSTONETree instance representing the feature hierarchy.
         """
-        self.dataset = copy.deepcopy(dataset)
+        self.data = copy.deepcopy(dataset)
         self.tree = tree
 
         # Ensure that the dataset is normalized and one-hot encoded, but not clr-transformed
-        if not self.dataset.normalized:
-            self.dataset.normalize()
-        if not self.dataset.one_hot_encoded:
-            self.dataset.one_hot_encode()
-        if self.dataset.clr_transformed:
+        if not self.data.normalized:
+            self.data.normalize()
+        if not self.data.one_hot_encoded:
+            self.data.one_hot_encode()
+        if self.data.clr_transformed:
             raise ValueError("Dataset must not be clr-transformed")
 
         # Compute distances
@@ -273,10 +352,10 @@ class MIOSTONEMixup:
         This method is used internally by the __init__ method.
         """
         # Aitchison distance is the Euclidean distance between the clr-transformed samples
-        distances = np.zeros((len(self.dataset), len(self.dataset)))
-        for i in range(len(self.dataset)):
-            for j in range(i+1, len(self.dataset)):
-                distances[i, j] = self._aitchison_distance(self.dataset.X[i], self.dataset.X[j])
+        distances = np.zeros((len(self.data), len(self.data)))
+        for i in range(len(self.data)):
+            for j in range(i+1, len(self.data)):
+                distances[i, j] = self._aitchison_distance(self.data.X[i], self.data.X[j])
         return distances
     
     def _compute_eligible_pairs(self, min_threshold, max_threshold):
@@ -288,8 +367,8 @@ class MIOSTONEMixup:
         :param max_threshold: A float representing the maximum Aitchison distance threshold.
         """
         eligible_pairs = []
-        for i in range(len(self.dataset)):
-            for j in range(i+1, len(self.dataset)):
+        for i in range(len(self.data)):
+            for j in range(i+1, len(self.data)):
                 if self.distances[i, j] >= min_threshold and self.distances[i, j] <= max_threshold:
                     eligible_pairs.append((i, j))
         return eligible_pairs
@@ -351,8 +430,8 @@ class MIOSTONEMixup:
 
     def _mixup_samples(self, idx1, idx2, lam):
         # Select the pair of samples
-        x1, y1 = self.dataset[idx1]
-        x2, y2 = self.dataset[idx2]
+        x1, y1 = self.data[idx1]
+        x2, y2 = self.data[idx2]
 
         # Compute Aitchison mixup
         mixed_x = self._aitchison_addition(self._aitchison_scalar_multiplication(lam, x1), self._aitchison_scalar_multiplication(1-lam, x2))
@@ -383,12 +462,12 @@ class MIOSTONEMixup:
             mixed_xs.append(mixed_x)
             mixed_ys.append(mixed_y)
 
-        self.dataset.X = np.vstack((self.dataset.X, np.array(mixed_xs)))
-        self.dataset.y = np.vstack((self.dataset.y, np.array(mixed_ys)))
+        self.data.X = np.vstack((self.data.X, np.array(mixed_xs)))
+        self.data.y = np.vstack((self.data.y, np.array(mixed_ys)))
 
-        self.dataset.clr_transform()
+        self.data.clr_transform()
 
-        return self.dataset
+        return self.data
     
     def _select_subtree(self, num_subtrees):
         """
@@ -427,14 +506,14 @@ class MIOSTONEMixup:
         :return: The swapped samples.
         """
         # Select the pair of samples
-        x1, y1 = self.dataset[idx1]
-        x2, y2 = self.dataset[idx2]
+        x1, y1 = self.data[idx1]
+        x2, y2 = self.data[idx2]
 
         num_swapped_leaves = 0
         for node in subtree_nodes:
             # Find the index of leaves in the subtree
             leaf_names = [leaf_name for leaf_name in node.leaf_names()]
-            leaf_idx = [self.dataset.features.tolist().index(leaf_name) for leaf_name in leaf_names]
+            leaf_idx = [self.data.features.tolist().index(leaf_name) for leaf_name in leaf_names]
             num_swapped_leaves += len(leaf_idx)
             # Swap the data of the tip nodes
             x1_orig, x2_orig = x1[leaf_idx].copy(), x2[leaf_idx].copy()
@@ -444,8 +523,8 @@ class MIOSTONEMixup:
             x2[leaf_idx] = x2[leaf_idx] * x2_orig.sum() / x2[leaf_idx].sum()
 
         # Compute the new labels
-        y1 = y1 * (1 - num_swapped_leaves / len(self.dataset.features)) + y2 * (num_swapped_leaves / len(self.dataset.features))
-        y2 = y2 * (1 - num_swapped_leaves / len(self.dataset.features)) + y1 * (num_swapped_leaves / len(self.dataset.features))
+        y1 = y1 * (1 - num_swapped_leaves / len(self.data.features)) + y2 * (num_swapped_leaves / len(self.data.features))
+        y2 = y2 * (1 - num_swapped_leaves / len(self.data.features)) + y1 * (num_swapped_leaves / len(self.data.features))
         
         return x1, y1, x2, y2
     
@@ -477,9 +556,9 @@ class MIOSTONEMixup:
             mixed_xs.append(mixed_x2)
             mixed_ys.append(mixed_y2)
 
-        self.dataset.X = np.vstack((self.dataset.X, np.array(mixed_xs)))
-        self.dataset.y = np.vstack((self.dataset.y, np.array(mixed_ys)))
+        self.data.X = np.vstack((self.data.X, np.array(mixed_xs)))
+        self.data.y = np.vstack((self.data.y, np.array(mixed_ys)))
 
-        self.dataset.clr_transform()
+        self.data.clr_transform()
 
-        return self.dataset
+        return self.data
