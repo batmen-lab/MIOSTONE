@@ -1,8 +1,6 @@
-import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.utils.prune as prune
 from captum.module import BinaryConcreteStochasticGates
 from scipy.stats import spearmanr
@@ -18,6 +16,95 @@ class DeterministicGate(nn.Module):
     
     def get_gate_values(self):
         return self.values
+    
+class MIOSTONELayer(nn.Module):
+    def __init__(self, 
+                 in_features, 
+                 out_features, 
+                 gate_type, 
+                 gate_param,
+                 connections):
+        super(MIOSTONELayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gate_type = gate_type
+        self.gate_param = gate_param
+        self.connections = connections
+        self.x_linear = None
+        self.l0_reg = None
+
+        # Initialize the layer
+        self._init_layer()
+
+    def _init_layer(self):
+        # MLP layer
+        self.mlp = nn.Sequential(
+            nn.Linear(self.in_features, self.out_features),
+            nn.ReLU(),
+        )
+        # Linear layer
+        self.linear = nn.Linear(self.in_features, self.out_features)
+
+        # Gate layer
+        if self.gate_type == "deterministic":
+            self.gate_layer = DeterministicGate(self.gate_param)
+        elif self.gate_type == "concrete":
+            self.gate_mask = self._generate_gate_mask()
+            self.gate_layer = BinaryConcreteStochasticGates(n_gates=len(self.connections),
+                                                           mask=self.gate_mask,
+                                                           temperature=self.gate_param)
+            
+        # Prune the network based on the connections
+        self._apply_pruning()
+
+
+    def _generate_gate_mask(self):
+        mask = torch.zeros(self.out_features, dtype=torch.int64)
+        value = 0
+        for _, output_indices in self.connections.values():
+            for output_index in output_indices:
+                mask[output_index] = value
+            value += 1
+
+        return mask
+
+    def _apply_pruning(self):
+        # Define a custom prune method for each layer
+        prune.custom_from_mask(self.mlp[0], name='weight', mask=self._generate_pruning_mask())
+        prune.custom_from_mask(self.linear, name='weight', mask=self._generate_pruning_mask())
+        # Remove the original weight parameter
+        prune.remove(self.mlp[0], 'weight')
+        prune.remove(self.linear, 'weight')
+
+    def _generate_pruning_mask(self):
+        # Start with a mask of all zeros (all connections pruned)
+        mask = torch.zeros((self.out_features, self.in_features), dtype=torch.int64)
+
+        # Iterate over the connections at the current depth and set the corresponding elements in the mask to 1
+        for input_indices, output_indices in self.connections.values():
+            for input_index in input_indices:
+                for output_index in output_indices:
+                    mask[output_index, input_index] = 1
+
+        return mask
+
+    def forward(self, x, x_linear):
+        # Apply the MLP layer
+        x = self.mlp(x)
+
+        # Apply the linear layer
+        self.x_linear = self.linear(x_linear)
+
+        # Apply the gate layer
+        x, self.l0_reg = self.gate_layer(x)
+        
+        # Apply the linear layer with the gate values
+        gate_values = self.gate_layer.get_gate_values()
+        if isinstance(self.gate_layer, BinaryConcreteStochasticGates):
+            gate_values = torch.gather(gate_values, 0, self.gate_mask.to(gate_values.device))
+        x = x + (1 - gate_values) * self.x_linear
+
+        return x
 
 class MIOSTONEModel(nn.Module):
     def __init__(self, 
@@ -36,12 +123,15 @@ class MIOSTONEModel(nn.Module):
         self.node_dim_func_param = node_dim_func_param
         self.node_gate_type = node_gate_type
         self.node_gate_param = node_gate_param
+        self.hidden_layers = None
+        self.output_layer = None
+        self.total_l0_reg = None
 
         # Initialize the architecture based on the tree
-        self._init_architecture_from_tree()
+        connections, layer_dims = self._init_architecture_from_tree()
 
         # Build the model based on the architecture
-        self._build_model()
+        self._build_model(connections, layer_dims)
 
     def _init_architecture_from_tree(self):
         # Define the node dimension function
@@ -53,8 +143,8 @@ class MIOSTONEModel(nn.Module):
                 return int(node_dim_func_param)
 
         # Initialize dictionary for connections and layer dimensions
-        self.connections = [{} for _ in range(self.tree.max_depth + 1)]
-        self.layer_dims = [None for _ in range(self.tree.max_depth + 1)]
+        layer_connections = [{} for _ in range(self.tree.max_depth + 1)]
+        layer_dims = [None for _ in range(self.tree.max_depth + 1)]
 
         curr_index = 0
         curr_depth = self.tree.max_depth
@@ -63,13 +153,13 @@ class MIOSTONEModel(nn.Module):
         for ete_node in reversed(list(self.tree.ete_tree.traverse("levelorder"))):
             node_depth = self.tree.depths[ete_node.name]
             if node_depth != curr_depth:
-                self.layer_dims[curr_depth] = (curr_index, prev_layer_out_features)
+                layer_dims[curr_depth] = (prev_layer_out_features, curr_index)
                 curr_depth = node_depth
                 prev_layer_out_features = curr_index
                 curr_index = 0
 
             if ete_node.is_leaf:
-                self.connections[curr_depth][ete_node.name] = ([], [curr_index])
+                layer_connections[curr_depth][ete_node.name] = ([], [curr_index])
                 curr_index += 1
                 continue
 
@@ -78,7 +168,7 @@ class MIOSTONEModel(nn.Module):
             # Calculate input indices
             input_indices = []
             for child in children:
-                child_output_indices = self.connections[node_depth + 1][child.name][1]
+                child_output_indices = layer_connections[node_depth + 1][child.name][1]
                 input_indices.extend(child_output_indices)
 
             # Calculate output dimensions and indices
@@ -91,84 +181,37 @@ class MIOSTONEModel(nn.Module):
             curr_index += node_out_features
 
             # Store in connections
-            self.connections[curr_depth][ete_node.name] = (input_indices, output_indices)
+            layer_connections[curr_depth][ete_node.name] = (input_indices, output_indices)
 
         # Append the dimension of the last layer
-        self.layer_dims[0] = (curr_index, prev_layer_out_features)
+        layer_dims[0] = (prev_layer_out_features, curr_index)
 
         # Remove the layer dimension of the leaf nodes
-        self.layer_dims = self.layer_dims[:-1]
+        layer_dims = layer_dims[:-1]
 
-    def _build_model(self):
-        self.mlp_layers = nn.ModuleList()
-        self.linear_layers = nn.ModuleList()
-        self.gate_layers = nn.ModuleList()
-        self.gate_masks = []
+        return layer_connections, layer_dims
 
-        # Initialize the internal layers
-        for depth, (out_features, in_features) in enumerate(self.layer_dims):
-            # Initialize the mlp layer
-            mlp_layer = nn.Sequential(
-                nn.Linear(in_features, out_features),
-                nn.ReLU(),
-            )
-            self.mlp_layers.append(mlp_layer)
+    def _build_model(self, layer_connections, layer_dims):
+        # Initialize the hidden layers
+        self.hidden_layers = nn.ModuleList()
+        for depth, (in_features, out_features) in enumerate(layer_dims):
+            # Get the connections for the current layer
+            connections = layer_connections[depth]
 
-            # Initialize the linear layer
-            linear_layer = nn.Linear(in_features, out_features)
-            self.linear_layers.append(linear_layer)
-
-            # Initialize the gate layer
-            gate_mask = self._generate_gate_mask(depth)
-            if self.node_gate_type == "deterministic":
-                gate_layer = DeterministicGate(self.node_gate_param)
-            elif self.node_gate_type == "concrete":
-                gate_layer = BinaryConcreteStochasticGates(n_gates=len(self.connections[depth]), 
-                                                           mask=gate_mask,
-                                                           temperature=self.node_gate_param)
-            self.gate_masks.append(gate_mask)
-            self.gate_layers.append(gate_layer)
-
+            # Initialize the layer
+            layer = MIOSTONELayer(in_features, 
+                                  out_features, 
+                                  self.node_gate_type, 
+                                  self.node_gate_param, 
+                                  connections)
+            self.hidden_layers.append(layer)
+            
         # Initialize the output layer
-        output_layer_in_features = self.layer_dims[0][0] 
+        output_layer_in_features = layer_dims[0][1] 
         self.output_layer = nn.Sequential(
             nn.BatchNorm1d(output_layer_in_features),
             nn.Linear(output_layer_in_features, self.out_features)
         )
-
-        # Prune the network based on the connections
-        self._apply_pruning()
-
-    def _generate_gate_mask(self, depth):
-        mask = torch.zeros(self.layer_dims[depth][0], dtype=torch.int64)
-        value = 0
-        for _, output_indices in self.connections[depth].values():
-            for output_index in output_indices:
-                mask[output_index] = value
-            value += 1
-
-        return mask
-
-    def _apply_pruning(self):
-        for depth, (mlp_layer, linear_layer) in enumerate(zip(self.mlp_layers, self.linear_layers)):
-            # Define a custom prune method for each layer
-            prune.custom_from_mask(mlp_layer[0], name='weight', mask=self._generate_pruning_mask(depth))
-            prune.custom_from_mask(linear_layer, name='weight', mask=self._generate_pruning_mask(depth))
-            # Remove the original weight parameter
-            prune.remove(mlp_layer[0], 'weight')
-            prune.remove(linear_layer, 'weight')
-
-    def _generate_pruning_mask(self, depth):
-        # Start with a mask of all zeros (all connections pruned)
-        mask = torch.zeros(self.layer_dims[depth])
-
-        # Iterate over the connections at the current depth and set the corresponding elements in the mask to 1
-        for input_indices, output_indices in self.connections[depth].values():
-            for input_index in input_indices:
-                for output_index in output_indices:
-                    mask[output_index, input_index] = 1
-
-        return mask
     
     def forward(self, x):
         # Initialize the total l0 regularization
@@ -179,37 +222,21 @@ class MIOSTONEModel(nn.Module):
 
         # Iterate over the layers
         for depth in reversed(range(self.tree.max_depth)):
-            # Get the layers
-            mlp_layer = self.mlp_layers[depth]
-            linear_layer = self.linear_layers[depth]
-            gate_layer = self.gate_layers[depth]
-            gate_mask = self.gate_masks[depth]
+            # Apply the layer
+            x = self.hidden_layers[depth](x, x_linear)
 
-            # Apply the mlp layer
-            x = mlp_layer(x)
+            # Update the linear layer input
+            x_linear = self.hidden_layers[depth].x_linear
+            self.hidden_layers[depth].x_linear = None
 
-            # Apply the linear layer
-            x_linear = linear_layer(x_linear)
-
-            # Apply the gate layer
-            x, l0_reg = gate_layer(x)
-            self.total_l0_reg += l0_reg
-
-            # Apply the linear layer with the gate values
-            gate_values = gate_layer.get_gate_values()
-            gate_values = self._reshape_gate_values(gate_values, gate_mask)
-            x = x + (1 - gate_values) * x_linear
+            # Update the total l0 regularization
+            self.total_l0_reg += self.hidden_layers[depth].l0_reg
+            self.hidden_layers[depth].l0_reg = None
 
         # Apply the output layer
         x = self.output_layer(x)
 
         return x
-    
-    def _reshape_gate_values(self, gate_values, gate_mask):
-        new_gate_values = torch.zeros(gate_mask.shape).to(gate_values.device)
-        for i, value in enumerate(gate_values):
-            new_gate_values[gate_mask == i] = value
-        return new_gate_values
     
     def get_total_l0_reg(self):
        return self.total_l0_reg
@@ -267,12 +294,7 @@ class TaxoNN(nn.Module):
                 continue
 
             # Calculate Spearman correlation matrix
-            with warnings.catch_warnings():
-                warnings.filterwarnings('error')
-                try :
-                    corr_matrix, _ = spearmanr(data)
-                except Warning:
-                    print(f"Data: {data}")
+            corr_matrix, _ = spearmanr(data)
 
             # Sum of correlations for each feature
             corr_sum = np.sum(corr_matrix, axis=0)
@@ -330,7 +352,17 @@ class TaxoNN(nn.Module):
     
     def get_total_l0_reg(self):
         return torch.tensor(0.0).to(self.output_layer[0].weight.device)
-    
+
+class GaussianNoise(nn.Module):
+    def __init__(self, sigma):
+        super(GaussianNoise, self).__init__()
+        self.sigma = sigma
+
+    def forward(self, x):
+        if self.training:
+            noise = torch.randn_like(x) * self.sigma
+            return x + noise
+        return x
 
 class PopPhyCNN(nn.Module):
     def __init__(self, 
@@ -357,6 +389,7 @@ class PopPhyCNN(nn.Module):
         self._build_model()
 
     def _build_model(self):
+        self.gaussian_noise = GaussianNoise(0.01)
         self.cnn_layers = self._create_conv_layers()
         self.fc_layers = self._create_fc_layers()
         self.output_layer = nn.Linear(self.num_fc_nodes, self.out_features)
@@ -365,7 +398,7 @@ class PopPhyCNN(nn.Module):
         layers = []
         for i in range(self.num_cnn_layers):
             in_channels = 1 if i == 0 else self.num_kernel
-            layers.append(nn.Conv2d(in_channels, self.num_kernel, (self.kernel_height, self.kernel_width), padding=1))
+            layers.append(nn.Conv2d(in_channels, self.num_kernel, (self.kernel_height, self.kernel_width)))
             layers.append(nn.ReLU())
             layers.append(nn.MaxPool2d(kernel_size=2))
         layers.append(nn.Flatten())
@@ -387,7 +420,7 @@ class PopPhyCNN(nn.Module):
         return self.cnn_layers(dummy_input).shape[1]
 
     def forward(self, x):
-        x = x.unsqueeze(1)
+        x = self.gaussian_noise(x.unsqueeze(1))
         x = self.cnn_layers(x)
         x = self.fc_layers(x)
         x = self.output_layer(x)

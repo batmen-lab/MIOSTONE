@@ -276,12 +276,10 @@ class MIOSTONEDataset(Dataset):
         :param tree: A MIOSTONETree instance.
         :param scaler: A Scaler instance to apply to the matrix. Defaults to None.
         :return: A Scaler instance used to scale the matrix.
-        :raises ValueError: If the dataset is already in tree matrix representation or is normalized or CLR transformed.
+        :raises ValueError: If the dataset is already in tree matrix representation or is CLR transformed.
         """
         if self.tree_matrix_repr:
             raise ValueError("Dataset is already in tree matrix representation")
-        if self.normalized:
-            raise ValueError("Dataset must not be normalized before converting to tree matrix representation")
         if self.clr_transformed:
             raise ValueError("Dataset must not be clr-transformed before converting to tree matrix representation")
 

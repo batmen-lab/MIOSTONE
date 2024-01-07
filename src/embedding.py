@@ -8,7 +8,7 @@ from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import TreeModel
+from model import MIOSTONEModel
 from pipeline import Pipeline
 
 
@@ -17,42 +17,40 @@ class EmbeddingPipeline(Pipeline):
         super().__init__(seed)
         self.reducers = {"pca": PCA(random_state=seed), "tsne": TSNE(random_state=seed), "umap": umap.UMAP(random_state=seed)}
         self.taxonomic_ranks = ["Life", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Strain"]
-        
-    def _validate_model(self):
-        if not isinstance(self.model, TreeModel):
-            raise ValueError("The model must be a TreeModel.")
 
-    def _fetch_node_outputs(self, depth):
+    def _capture_embeddings(self):
+        # Ensure that the model and data are properly set up
+        if not self.model or not self.data:
+            raise RuntimeError("Model and data must be loaded before capturing embeddings.")
+        
+        # Validate that the model is an instance of MIOSTONEModel
+        if not isinstance(self.model, MIOSTONEModel):
+            raise ValueError("Model must be an instance of MIOSTONEModel.")
+
+        # Register hooks to capture embeddings from each layer
+        self._register_hooks()
+
+        # Initialize the dictionary of embeddings with the input data
+        self.embeddings = {self.model.tree.max_depth: self.data.X}
+
+        # Perform a forward pass through the model to capture embeddings
         self.model.eval()
         dataloader = DataLoader(self.data, batch_size=2048, shuffle=False)
-        embeddings = []
-
         for inputs, _ in dataloader:
             self.model(inputs)
-            node_outputs = [self.model.outputs[ete_node.name][0].detach().cpu().numpy() 
-                            for ete_node in self.tree.ete_tree.traverse("levelorder") 
-                            if self.tree.depths[ete_node.name] == depth and ete_node.name in self.model.outputs]
 
-            if node_outputs:
-                embeddings.append(np.concatenate(node_outputs, axis=1))
-            else:
-                raise ValueError(f"No nodes found at depth {depth}.")
+        # Unregister hooks to prevent any potential memory leak
+        for layer in self.model.hidden_layers:
+            layer._forward_hooks.clear()
 
-        return np.concatenate(embeddings, axis=0)
+    def _register_hooks(self):
+        def hook_function(module, input, output, depth):
+            self.embeddings[depth] = output.detach()
 
-    def _extract_embeddings_at_depth(self, depth):
-        depth = min(depth, self.tree.max_depth)
-        return self._fetch_node_outputs(depth)
-
-    def _plot_embeddings_with_labels(self, X_transformed, labels, title, ax):
-        for label in labels:
-            idx = np.where(self.data.y == label)
-            ax.scatter(*X_transformed[idx].T[:2], label=label, alpha=0.6)
-
-        ax.set_xlabel("Component 1")
-        ax.set_ylabel("Component 2" if X_transformed.shape[1] > 1 else "Constant")
-        ax.set_title(title)
-        ax.legend()
+        for depth, layer in enumerate(self.model.hidden_layers):
+            layer.register_forward_hook(
+                lambda module, input, output, depth=depth: hook_function(module, input, output, depth)
+            )
 
     def _visualize_embeddings_across_depths(self, reducer):
         depths = range(1, self.tree.max_depth + 1)
@@ -62,11 +60,11 @@ class EmbeddingPipeline(Pipeline):
 
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows))
         for i, depth in tqdm(enumerate(depths, start=1), total=n_plots):
-            embeddings = self._extract_embeddings_at_depth(depth)
-            X_transformed = self.reducers[reducer].fit_transform(embeddings)
+            embeddings = self.embeddings[depth]
+            reduced_embeddings = self.reducers[reducer].fit_transform(embeddings)
             title = f"{reducer.upper()} "
-            title += f"({self.taxonomic_ranks[depth]})" if depth < len(self.taxonomic_ranks) else f"(Raw Data)"
-            self._plot_embeddings_with_labels(X_transformed, labels, title, axes.flatten()[i - 1])
+            title += f"({self.taxonomic_ranks[depth]})"
+            self._plot_embeddings_with_labels(reduced_embeddings, labels, title, axes.flatten()[i - 1])
 
         for ax in axes.flatten()[n_plots:]:
             ax.axis('off')
@@ -75,12 +73,22 @@ class EmbeddingPipeline(Pipeline):
         plt.savefig(f"{self.output_dir}/embeddings/{reducer}.png")
         plt.show()
 
+    def _plot_embeddings_with_labels(self, reduced_embeddings, labels, title, ax):
+        for label in labels:
+            idx = np.where(self.data.y == label)
+            ax.scatter(*reduced_embeddings[idx].T[:2], label=label, alpha=0.6)
+
+        ax.set_xlabel("Component 1")
+        ax.set_ylabel("Component 2" if reduced_embeddings.shape[1] > 1 else "Constant")
+        ax.set_title(title)
+        ax.legend()
+
     def run(self, dataset, target, model_fn, reducer):
         self._load_data_and_tree(dataset, target)
         model_fp = f"{self.output_dir}/models/{model_fn}.pt"
-        results_fp = f"{self.output_dir}/results/{model_fn.replace('model', 'result')}.json"
+        results_fp = f"{self.output_dir}/results/{model_fn}.json"
         self._load_model(model_fp, results_fp)
-        self._validate_model()
+        self._capture_embeddings()
         self._visualize_embeddings_across_depths(reducer)
 
 def run_embeddings_pipeline(dataset, target, model_fn, reducer, seed):

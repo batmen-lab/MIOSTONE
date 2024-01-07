@@ -8,9 +8,8 @@ from captum.attr import DeepLift, LayerDeepLift
 from ete4.treeview import RectFace, TreeStyle
 from matplotlib import cm
 from matplotlib.colors import to_hex
-from tqdm import tqdm
 
-from model import TreeModel
+from model import MIOSTONEModel
 from pipeline import Pipeline
 
 
@@ -18,11 +17,7 @@ class AttributionPipeline(Pipeline):
     def __init__(self, seed):
         super().__init__(seed)
         self.internal_attributions = {}
-        self.leaf_attributions = {}
-
-    def _validate_model(self):
-        if not isinstance(self.model, TreeModel):
-            raise ValueError("The model must be a TreeModel.")
+        self.leaf_attributions = {}        
 
     def _load_attributions(self):
         with open(f"{self.output_dir}/attributions/internal_attributions.json", "r") as f:
@@ -60,12 +55,19 @@ class AttributionPipeline(Pipeline):
             attributions[node] = (value - min_value) / (max_value - min_value)
 
     def _compute_internal_attributions(self, inputs, baselines, targets, depth):
-        ete_nodes = [ete_node for ete_node in self.tree.ete_tree.traverse("levelorder") if self.tree.depths[ete_node.name] == depth]
-        for ete_node in tqdm(ete_nodes, total=len(ete_nodes)):
-            model_node = self.model.nodes[ete_node.name]
-            attributor = LayerDeepLift(self.model, model_node, multiply_by_inputs=False)
-            attribution = attributor.attribute(inputs, baselines=baselines, target=targets).detach().cpu().numpy()
-            self.internal_attributions[ete_node.name] = np.mean(np.sum(np.abs(attribution), axis=1), axis=0).astype(float)
+        if not self.model:
+            raise RuntimeError("Model must be loaded before computing attributions.")
+        if not isinstance(self.model, MIOSTONEModel):
+            raise ValueError("Model must be an instance of MIOSTONEModel.")
+        if depth < 0 or depth >= self.tree.max_depth:
+            raise ValueError(f"Depth must be between 0 and {self.tree.max_depth - 1}.")
+        
+        layer = self.model.hidden_layers[depth]
+        attributor = LayerDeepLift(self.model, layer, multiply_by_inputs=False)
+        attribution = attributor.attribute(inputs, baselines=baselines, target=targets).detach().cpu().numpy()
+        for node_name, indices in layer.connections.items():
+            output_indices = indices[1]
+            self.internal_attributions[node_name] = np.mean(np.sum(np.abs(attribution[:, output_indices]), axis=1), axis=0).astype(float)
 
         self._normalize_attributions(self.internal_attributions)
         
@@ -102,6 +104,20 @@ class AttributionPipeline(Pipeline):
             leaf.add_face(colored_rectface, column=2, position="aligned")
 
     def _visualize(self):
+        # Print the top 10 internal nodes with the highest DeepLIFT attributions
+        print("Top 10 internal nodes with the highest DeepLIFT attributions:")
+        for node_name, value in sorted(self.internal_attributions.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"{node_name}: {value}")
+            i = 0
+            for leaf_name, leaf_value in sorted(self.leaf_attributions.items(), key=lambda x: x[1], reverse=True):
+                leaf = list(self.tree.ete_tree.search_leaves_by_name(name=leaf_name))[0]
+                if list(leaf.search_ancestors(name=node_name)) != []:
+                    print(f"\t{leaf_name}: {leaf_value}")
+                    print(f"\t{leaf.up.name}")
+                    i += 1
+                if i == 3:
+                    break
+
         # Generate colors
         internal_colors = self._generate_colors(self.internal_attributions)
         leaf_colors = self._generate_colors(self.leaf_attributions)
@@ -134,7 +150,6 @@ class AttributionPipeline(Pipeline):
         model_fp = f"{self.output_dir}/models/{model_fn}.pt"
         results_fp = f"{self.output_dir}/results/{model_fn.replace('model', 'result')}.json"
         self._load_model(model_fp, results_fp)
-        self._validate_model()
         num_samples = len(self.data) if num_samples is None else num_samples
         inputs, baselines, targets = self._preprocess_data(num_samples)
         self._compute_internal_attributions(inputs, baselines, targets, depth)

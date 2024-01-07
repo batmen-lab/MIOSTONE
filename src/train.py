@@ -1,6 +1,7 @@
 import argparse
 import json
 import pickle
+import time
 from datetime import datetime
 
 import numpy as np
@@ -143,10 +144,11 @@ class TrainingPipeline(Pipeline):
 
     def _run_training(self, classifier, train_dataset, test_dataset):
         if self.model_type == 'rf':
+            start_time = time.time()
             classifier.fit(train_dataset.X, train_dataset.y)
+            time_elapsed = time.time() - start_time
             test_true_labels = torch.tensor(test_dataset.y)
             test_logits = torch.tensor(classifier.predict_proba(test_dataset.X))
-            time_elapsed = 0
         else:
             data_module = DataModule(train_dataset, test_dataset, test_dataset, batch_size=self.train_hparams['batch_size'], num_workers=1)
             timer = Timer()
@@ -173,7 +175,7 @@ class TrainingPipeline(Pipeline):
     
     def _save_result(self, result, filename):
         results_dir = self.output_dir + 'results/'
-        with open(results_dir + filename, 'w') as f:
+        with open(results_dir + filename + '.json', 'w') as f:
             json.dump(result, f, indent=4)
 
     def _compute_metrics(self, metrics, test_logits, test_labels):
@@ -228,11 +230,10 @@ class TrainingPipeline(Pipeline):
             seed_everything(self.seed)
 
             # Prepare datasets
-            normalize = False if self.model_type == 'popphycnn' else True
             one_hot_encoding = True if self.mixup_hparams else False
             clr = False if self.model_type == 'popphycnn' else True
-            train_dataset = self._create_subset(train_index, normalize=normalize, one_hot_encoding=one_hot_encoding, clr=clr)
-            test_dataset = self._create_subset(test_index, normalize=normalize, one_hot_encoding=False, clr=clr)
+            train_dataset = self._create_subset(train_index, one_hot_encoding=one_hot_encoding, clr=clr)
+            test_dataset = self._create_subset(test_index, one_hot_encoding=False, clr=clr)
 
             # Apply MIOSTONEMixup if specified
             if self.mixup_hparams:
@@ -265,15 +266,14 @@ class TrainingPipeline(Pipeline):
             }
 
             # Save results and model
-            filename = f"{self.seed}_{fold}_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filename = f"{self.seed}_{fold}_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             self._save_result(result, filename)
-            # self._save_model(classifier, filename)
+            self._save_model(classifier, filename)
 
         # Compute CV scores
         self._compute_mean_std_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
         self._compute_global_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
 
-        
     def run(self, dataset, target, model_type):
         # Load data and tree
         self._load_data_and_tree(dataset, target, preprocess=False)
@@ -288,9 +288,9 @@ class TrainingPipeline(Pipeline):
             self.model_hparams['node_gate_param'] = 0.3
         elif self.model_type == 'popphycnn':
             self.model_hparams['num_kernel'] = 32
-            self.model_hparams['kernel_height'] = 10
-            self.model_hparams['kernel_width'] = 3
-            self.model_hparams['num_fc_nodes'] = 32
+            self.model_hparams['kernel_height'] = 3
+            self.model_hparams['kernel_width'] = 10
+            self.model_hparams['num_fc_nodes'] = 512
             self.model_hparams['num_cnn_layers'] = 1
             self.model_hparams['num_fc_layers'] = 1
             self.model_hparams['dropout'] = 0.3

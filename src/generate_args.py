@@ -3,9 +3,9 @@ import os
 
 # Possible values for each argument
 seeds = range(10)
-datasets = ['ibd200', 'alzbiom', 'asd']
+datasets = ['ibd200', 'alzbiom', 'asd', 'hmp2']
 targets = ['type', 'ad', 'stage']
-model_types = ['rf', 'mlp', 'taxonn', 'popphycnn', 'miostone']
+model_types = ['miostone']
 
 # Function to validate that the combination of arguments is valid
 def validate_args(combination):

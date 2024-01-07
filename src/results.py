@@ -42,7 +42,7 @@ class ResultsAnalyzer:
         metrics = MetricCollection([
             MulticlassAccuracy(num_classes=num_classes),
             MulticlassAUROC(num_classes=num_classes),
-            MulticlassAveragePrecision(num_classes=num_classes)
+            MulticlassAveragePrecision(num_classes=num_classes),
         ])
          # Group the results by 'Model Type', 'Model Hparams', 'Train Hparams', 'Mixup Hparams'
         grouped_results = self.results.groupby(['Seed', 'Model Type', 'Model Hparams', 'Train Hparams', 'Mixup Hparams'])
@@ -70,7 +70,7 @@ class ResultsAnalyzer:
                 'Mixup Hparams': mixup_hparams,
                 'Accuracy': scores['MulticlassAccuracy'].item(),
                 'AUROC': scores['MulticlassAUROC'].item(),
-                'AUPRC': scores['MulticlassAveragePrecision'].item()
+                'AUPRC': scores['MulticlassAveragePrecision'].item(),
             }
             rows.append(row)
         
@@ -87,7 +87,7 @@ class ResultsAnalyzer:
         # Create a figure with subplots - one for each metric
         fig, axes = plt.subplots(1, len(metrics), figsize=(15, 5))
 
-        # Set the title of the figure\
+        # Set the title of the figure
         fig.suptitle(f'{self.dataset} - {self.target}', fontsize=20)
 
         # Iterate over each metric to create a subplot
@@ -118,6 +118,33 @@ class ResultsAnalyzer:
         # Show the plot
         plt.show()
 
+    
+    def _visualize_time_elapsed(self):
+        # Set the style for the plots
+        sns.set(style="whitegrid")
+
+        # Create a plot
+        plt.figure(figsize=(10, 6))
+
+        # Use seaborn to create a bar plot
+        sns.barplot(x='Model Type', 
+                    y='Time Elapsed', 
+                    data=self.results,
+                    order=['rf', 'mlp', 'taxonn', 'popphycnn', 'miostone'],
+                    errorbar="sd", 
+                    errwidth=2)
+
+        # Set plot title and labels
+        plt.title(f'{self.dataset} - {self.target}', fontsize=20)
+        plt.xlabel('')
+        plt.ylabel('Average Time Elapsed (seconds)')
+
+        # Adjust layout for better visualization
+        plt.tight_layout()
+
+        # Show the plot
+        plt.show()
+
     def _annotate_bar_plot(self, ax):
         # Set the offset for the annotations
         offset = 0.01 * (ax.get_ylim()[1] - ax.get_ylim()[0])
@@ -131,14 +158,17 @@ class ResultsAnalyzer:
             ax.annotate(f"{bar_length:.2f}", xy=position, ha='center', va='center', fontsize=16, color='black')
 
        
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True, help='The dataset to analyze')
     parser.add_argument('--target', type=str, required=True, help='The target to analyze')
+    parser.add_argument('--visualize', type=str, required=True, choices=['scores', 'time'], help='The type of visualization to generate')
     args = parser.parse_args()
 
     analyzer = ResultsAnalyzer('../output/')
     analyzer._load_results(args.dataset, args.target)
     analyzer._compute_metircs()
-    analyzer._visualize_scores()
+    if args.visualize == 'scores':
+        analyzer._visualize_scores()
+    elif args.visualize == 'time':
+        analyzer._visualize_time_elapsed()
