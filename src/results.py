@@ -20,12 +20,13 @@ class ResultsAnalyzer:
         self.dataset = None
         self.target = None
         
-    def _load_results(self, dataset, target):
+    def _load_results(self, dataset, target, transfer_learning=False):
         self.dataset = dataset
         self.target = target
 
         results = []
-        results_dir = os.path.join(self.output_dir, dataset, target, 'results')
+        dir_name = 'transfer_learning' if transfer_learning else 'results'
+        results_dir = os.path.join(self.output_dir, dataset, target, dir_name)
         for filepath in glob.glob(os.path.join(results_dir, '*.json')):
             with open(filepath, 'r') as f:
                 result = json.load(f)
@@ -44,6 +45,7 @@ class ResultsAnalyzer:
             MulticlassAUROC(num_classes=num_classes),
             MulticlassAveragePrecision(num_classes=num_classes),
         ])
+
          # Group the results by 'Model Type', 'Model Hparams', 'Train Hparams', 'Mixup Hparams'
         grouped_results = self.results.groupby(['Seed', 'Model Type', 'Model Hparams', 'Train Hparams', 'Mixup Hparams'])
 
@@ -65,13 +67,16 @@ class ResultsAnalyzer:
             row = {
                 'Seed': seed,
                 'Model Type': model_type,
-                'Model Hparams': model_hparams,
-                'Train Hparams': train_hparams,
-                'Mixup Hparams': mixup_hparams,
                 'Accuracy': scores['MulticlassAccuracy'].item(),
                 'AUROC': scores['MulticlassAUROC'].item(),
                 'AUPRC': scores['MulticlassAveragePrecision'].item(),
             }
+            for key, value in model_hparams:
+                row[key] = value
+            for key, value in train_hparams:
+                row[key] = value
+            for key, value in mixup_hparams:
+                row[key] = value
             rows.append(row)
         
         # Create a dataframe from the rows
@@ -93,10 +98,11 @@ class ResultsAnalyzer:
         # Iterate over each metric to create a subplot
         for i, metric in enumerate(metrics):
             # Use seaborn to create a bar plot with error bars on the corresponding subplot
-            sns.barplot(x='Model Type', 
+            sns.barplot(data=self.scores,
+                        x='Model Type',
                         y=metric, 
-                        data=self.scores, 
-                        order=['rf', 'mlp', 'taxonn', 'popphycnn', 'miostone'],
+                        hue='Model Type',
+                        hue_order=['rf', 'mlp', 'taxonn', 'popphycnn', 'miostone'],
                         errorbar="sd", 
                         errwidth=2, 
                         ax=axes[i])
@@ -163,10 +169,11 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, required=True, help='The dataset to analyze')
     parser.add_argument('--target', type=str, required=True, help='The target to analyze')
     parser.add_argument('--visualize', type=str, required=True, choices=['scores', 'time'], help='The type of visualization to generate')
+    parser.add_argument('--transfer_learning', action='store_true', help='Whether to analyze transfer learning results')
     args = parser.parse_args()
 
     analyzer = ResultsAnalyzer('../output/')
-    analyzer._load_results(args.dataset, args.target)
+    analyzer._load_results(args.dataset, args.target, args.transfer_learning)
     analyzer._compute_metircs()
     if args.visualize == 'scores':
         analyzer._visualize_scores()

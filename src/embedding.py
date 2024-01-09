@@ -16,7 +16,6 @@ class EmbeddingPipeline(Pipeline):
     def __init__(self, seed):
         super().__init__(seed)
         self.reducers = {"pca": PCA(random_state=seed), "tsne": TSNE(random_state=seed), "umap": umap.UMAP(random_state=seed)}
-        self.taxonomic_ranks = ["Life", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Strain"]
 
     def _capture_embeddings(self):
         # Ensure that the model and data are properly set up
@@ -31,7 +30,7 @@ class EmbeddingPipeline(Pipeline):
         self._register_hooks()
 
         # Initialize the dictionary of embeddings with the input data
-        self.embeddings = {self.model.tree.max_depth: self.data.X}
+        self.embeddings = {self.tree.max_depth: self.data.X}
 
         # Perform a forward pass through the model to capture embeddings
         self.model.eval()
@@ -63,7 +62,7 @@ class EmbeddingPipeline(Pipeline):
             embeddings = self.embeddings[depth]
             reduced_embeddings = self.reducers[reducer].fit_transform(embeddings)
             title = f"{reducer.upper()} "
-            title += f"({self.taxonomic_ranks[depth]})"
+            title += f"({self.tree.taxonomic_ranks[depth]})"
             self._plot_embeddings_with_labels(reduced_embeddings, labels, title, axes.flatten()[i - 1])
 
         for ax in axes.flatten()[n_plots:]:
@@ -83,7 +82,7 @@ class EmbeddingPipeline(Pipeline):
         ax.set_title(title)
         ax.legend()
 
-    def run(self, dataset, target, model_fn, reducer):
+    def run(self, dataset, target, model_fn, reducer, *args, **kwargs):
         self._load_data_and_tree(dataset, target)
         model_fp = f"{self.output_dir}/models/{model_fn}.pt"
         results_fp = f"{self.output_dir}/results/{model_fn}.json"

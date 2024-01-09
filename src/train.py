@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import pickle
 import time
@@ -17,8 +18,9 @@ from torchmetrics import MetricCollection
 from torchmetrics.classification import (MulticlassAccuracy, MulticlassAUROC,
                                          MulticlassAveragePrecision)
 
+from baseline import MLP, PopPhyCNN, TaxoNN
 from data import MIOSTONEDataset, MIOSTONEMixup
-from model import MLP, MIOSTONEModel, PopPhyCNN, TaxoNN
+from model import MIOSTONEModel
 from pipeline import Pipeline
 
 
@@ -97,10 +99,10 @@ class TrainingPipeline(Pipeline):
         self.train_hparams = {}
         self.mixup_hparams = {}
 
-    def _create_subset(self, indices, normalize=True, one_hot_encoding=True, clr=True):
-        X_subset = self.data.X[indices]
-        y_subset = self.data.y[indices]
-        subset = MIOSTONEDataset(X_subset, y_subset, self.data.features)
+    def _create_subset(self, data, indices, normalize=True, one_hot_encoding=True, clr=True):
+        X_subset = data.X[indices]
+        y_subset = data.y[indices]
+        subset = MIOSTONEDataset(X_subset, y_subset, data.features)
         if normalize:
             subset.normalize()
         if one_hot_encoding:
@@ -120,33 +122,41 @@ class TrainingPipeline(Pipeline):
     def _create_classifier(self, train_dataset):
         in_features = train_dataset.X.shape[1]
         out_features = train_dataset.num_classes
-        class_weight = train_dataset.class_weight if self.train_hparams['class_weight'] == 'balanced' else None
+        class_weight = train_dataset.class_weight if self.train_hparams['class_weight'] == 'balanced' else [1] * out_features
 
-        if class_weight is None:
-            class_weight = [1] * out_features
         if self.model_type == 'rf':
             class_weight = {key: value for key, value in enumerate(class_weight)}
-            classifier = RandomForestClassifier(class_weight=class_weight, random_state=self.seed, **self.model_hparams)
+            if self.model is not None:
+                classier = copy.deepcopy(self.model)
+                classifier = classier.set_params(class_weight=class_weight)
+            else:
+                classifier = RandomForestClassifier(class_weight=class_weight, random_state=self.seed, warm_start=True)
         else:
             class_weight = torch.tensor(class_weight).float()
             if self.model_type == 'mlp':
-                classifier = Classifier(MLP(in_features, out_features, **self.model_hparams), class_weight)
+                model = MLP(in_features, out_features, **self.model_hparams)
             elif self.model_type == 'taxonn':
-                classifier = Classifier(TaxoNN(self.tree, out_features, train_dataset, **self.model_hparams), class_weight)
+                model = TaxoNN(self.tree, out_features, train_dataset, **self.model_hparams)
             elif self.model_type == 'popphycnn':
-                classifier = Classifier(PopPhyCNN(self.tree, out_features, **self.model_hparams), class_weight)
+                model = PopPhyCNN(self.tree, out_features, **self.model_hparams)
             elif self.model_type == 'miostone':
-                classifier = Classifier(MIOSTONEModel(self.tree, out_features, **self.model_hparams), class_weight)
+                model = MIOSTONEModel(self.tree, out_features, **self.model_hparams)
             else:
                 raise ValueError(f"Invalid model type: {self.model_type}")
+            if self.model is not None:
+                model.load_state_dict(self.model.state_dict())
+    
+            classifier = Classifier(model, class_weight)
 
         return classifier
 
     def _run_training(self, classifier, train_dataset, test_dataset):
+        time_elapsed = 0
         if self.model_type == 'rf':
-            start_time = time.time()
-            classifier.fit(train_dataset.X, train_dataset.y)
-            time_elapsed = time.time() - start_time
+            if self.train_hparams['max_epochs'] > 0:
+                start_time = time.time()
+                classifier.fit(train_dataset.X, train_dataset.y)
+                time_elapsed = time.time() - start_time
             test_true_labels = torch.tensor(test_dataset.y)
             test_logits = torch.tensor(classifier.predict_proba(test_dataset.X))
         else:
@@ -204,7 +214,6 @@ class TrainingPipeline(Pipeline):
         print("Global CV Scores:")
         for metric, value in global_metrics.items():
             print(f"{metric}: {value:.4f}")
-        
 
     def _train(self):
         # Check if data and tree are loaded
@@ -232,8 +241,8 @@ class TrainingPipeline(Pipeline):
             # Prepare datasets
             one_hot_encoding = True if self.mixup_hparams else False
             clr = False if self.model_type == 'popphycnn' else True
-            train_dataset = self._create_subset(train_index, one_hot_encoding=one_hot_encoding, clr=clr)
-            test_dataset = self._create_subset(test_index, one_hot_encoding=False, clr=clr)
+            train_dataset = self._create_subset(self.data, train_index, one_hot_encoding=one_hot_encoding, clr=clr)
+            test_dataset = self._create_subset(self.data, test_index, one_hot_encoding=False, clr=clr)
 
             # Apply MIOSTONEMixup if specified
             if self.mixup_hparams:
@@ -274,7 +283,7 @@ class TrainingPipeline(Pipeline):
         self._compute_mean_std_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
         self._compute_global_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
 
-    def run(self, dataset, target, model_type):
+    def run(self, dataset, target, model_type, *args, **kwargs):
         # Load data and tree
         self._load_data_and_tree(dataset, target, preprocess=False)
 
@@ -298,7 +307,7 @@ class TrainingPipeline(Pipeline):
         # Configure default training parameters
         self.train_hparams['k_folds'] = 5
         self.train_hparams['batch_size'] = 512
-        self.train_hparams['max_epochs'] = 100
+        self.train_hparams['max_epochs'] = 200
         self.train_hparams['class_weight'] = 'balanced'
 
         # Configure default mixup parameters

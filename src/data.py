@@ -28,6 +28,7 @@ class MIOSTONETree:
         self.ete_tree = ete_tree
         self.depths = {}
         self.max_depth = 0
+        self.taxonomic_ranks = ["Life", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Strain"]
 
     def prune(self, features):
         """
@@ -196,7 +197,17 @@ class MIOSTONEDataset(Dataset):
         self.y = np.eye(len(np.unique(self.y)))[self.y.astype(int)]
         self.one_hot_encoded = True
 
-    def add_features_from_tree(self, tree):
+    def drop_features_by_tree(self, tree):
+        """
+        Drop features from the dataset based on the tree.
+        
+        :param tree: A MIOSTONETree instance.
+        """
+        leaf_names = [leaf for leaf in tree.ete_tree.leaf_names() if leaf in self.features]
+        self.X = self.X[:, [self.features.tolist().index(leaf) for leaf in leaf_names]]
+        self.features = np.array(leaf_names)
+
+    def add_features_by_tree(self, tree):
         """
         Add new features to the dataset based on the tree. The new features take the
         values of the closest existing feature in the dataset.
@@ -220,7 +231,7 @@ class MIOSTONEDataset(Dataset):
 
         for leaf in tree.ete_tree.leaves():
             if leaf.name not in existing_features:
-                closest_feature = self._find_closest_in_ancestors(leaf, existing_features)
+                closest_feature = self._find_closest_by_common_ancestor(leaf, existing_features)
                 if closest_feature:
                     closest_features[leaf.name] = closest_feature
 
@@ -239,7 +250,7 @@ class MIOSTONEDataset(Dataset):
         current_node = leaf
         while current_node.up:
             current_node = current_node.up
-            for desc in current_node.get_descendants():
+            for desc in current_node.descendants():
                 if desc.name in existing_features:
                     return desc.name
         return None
@@ -256,7 +267,9 @@ class MIOSTONEDataset(Dataset):
             closest_feature_index = np.where(self.features == closest_feature)[0][0]
             new_feature_values = self.X[:, closest_feature_index]
             new_features_data.append(new_feature_values)
+            self.features = np.append(self.features, new_feature)
 
+        new_features_data = np.array(new_features_data).T
         self.X = np.column_stack((self.X, new_features_data))
 
     def order_features_by_tree(self, tree):

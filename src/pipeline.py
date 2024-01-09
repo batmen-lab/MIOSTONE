@@ -9,7 +9,8 @@ from ete4 import Tree
 from lightning.fabric.utilities.seed import seed_everything
 
 from data import MIOSTONEDataset, MIOSTONETree
-from model import MLP, MIOSTONEModel
+from model import MIOSTONEModel
+from baseline import MLP
 
 
 class Pipeline(ABC):
@@ -27,7 +28,7 @@ class Pipeline(ABC):
         seed_everything(self.seed)
 
     def _create_output_dir(self):
-        subdirectories = ['models', 'results', 'embeddings', 'attributions']
+        subdirectories = ['models', 'results', 'embeddings', 'attributions', 'transfer_learning']
         for subdir in subdirectories:
             dir_path = os.path.join(self.output_dir, subdir)
             os.makedirs(dir_path, exist_ok=True)

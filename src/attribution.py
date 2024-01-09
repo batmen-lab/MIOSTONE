@@ -145,7 +145,7 @@ class AttributionPipeline(Pipeline):
         self._load_attributions()
         self._visualize()
 
-    def run(self, dataset, target, model_fn, depth, num_samples):
+    def run(self, dataset, target, model_fn, depth, num_samples, *args, **kwargs):
         self._load_data_and_tree(dataset, target)
         model_fp = f"{self.output_dir}/models/{model_fn}.pt"
         results_fp = f"{self.output_dir}/results/{model_fn.replace('model', 'result')}.json"
