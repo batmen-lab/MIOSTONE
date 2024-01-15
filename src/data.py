@@ -5,7 +5,7 @@ import random
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import Dataset
 
 
@@ -101,6 +101,7 @@ class MIOSTONEDataset(Dataset):
         self.class_weight = len(y) / (self.num_classes * np.bincount(y))
         self.normalized = False
         self.clr_transformed = False
+        self.standardized = False
         self.one_hot_encoded = False
         self.tree_matrix_repr = False
 
@@ -167,7 +168,7 @@ class MIOSTONEDataset(Dataset):
         """
         if self.normalized:
             raise ValueError("Dataset is already normalized")
-        self.X = self.X + 1 # Add 1 to avoid division by 0
+        self.X = self.X + 1 # Add a small value to avoid division by zero
         self.X_sum = self.X.sum(axis=1, keepdims=True)
         self.X = self.X / self.X_sum
         self.normalized = True 
@@ -176,15 +177,42 @@ class MIOSTONEDataset(Dataset):
         """
         Apply centered log-ratio (CLR) transformation to the normalized dataset.
 
-        :raises ValueError: If the dataset is not normalized or is already CLR transformed.
+        :raises ValueError: If the dataset is already CLR transformed.
         """
-        if not self.normalized:
-            raise ValueError("Dataset must be normalized before clr-transformation")
         if self.clr_transformed:
             raise ValueError("Dataset is already clr-transformed")
-        self.X = np.log(self.X)
+        
+        # Apply log transformation
+        if self.normalized:
+            self.X = np.log(self.X)
+        else:
+            self.X = np.log1p(self.X)
+
+        # Subtract the mean of each sample
         self.X = self.X - self.X.mean(axis=1, keepdims=True)
+
         self.clr_transformed = True
+
+    def standardize(self, scaler=None):
+        """
+        Standardize the dataset by subtracting the mean and dividing by the standard deviation.
+
+        :param scaler: A Scaler instance to apply to the dataset. Defaults to None.
+        :return: A Scaler instance used to scale the dataset.
+        :raises ValueError: If the dataset is already standardized or not CLR transformed.
+        """
+        if self.standardized:
+            raise ValueError("Dataset is already standardized")
+        if not self.clr_transformed:
+            raise ValueError("Dataset must be clr-transformed before standardizing")
+        if scaler:
+            self.X = scaler.transform(X=self.X)
+        else:
+            scaler = StandardScaler()
+            self.X = scaler.fit_transform(X=self.X, y=self.y)
+
+        self.standardized = True
+        return scaler
 
     def one_hot_encode(self):
         """
@@ -215,9 +243,9 @@ class MIOSTONEDataset(Dataset):
         :param tree: A MIOSTONETree instance.
         """
         closest_features = self._find_closest_features(tree)
-        self._add_new_features(closest_features)
-        self.order_features_by_tree(tree)
-
+        if closest_features:
+            self._add_new_features(closest_features)
+        
     def _find_closest_features(self, tree):
         """
         Find the closest existing feature in the dataset for each new feature in the tree.
@@ -271,6 +299,7 @@ class MIOSTONEDataset(Dataset):
 
         new_features_data = np.array(new_features_data).T
         self.X = np.column_stack((self.X, new_features_data))
+        self.features = np.append(self.features, list(closest_features.keys()))
 
     def order_features_by_tree(self, tree):
         """
@@ -324,252 +353,3 @@ class MIOSTONEDataset(Dataset):
         self.tree_matrix_repr = True
 
         return scaler
-    
-        
-class MIOSTONEMixup:
-    """
-    A class for applying Mixup and Cutmix augmentations to MIOSTONE datasets using a tree-based structure. 
-    It handles the mixing of samples based on the Aitchison distance and tree-based relationships.
-
-    Attributes:
-        dataset (MIOSTONEDataset): The MIOSTONE dataset to be augmented.
-        tree (MIOSTONETree): A tree representing the hierarchical structure of features in the dataset.
-        alpha (float): The alpha parameter for the Beta distribution used in Mixup.
-    """
-    def __init__(self, dataset, tree, alpha=0.4):
-        """
-        Initialize the MIOSTONEMixup object.
-
-        :param dataset: MIOSTONEDataset instance for the dataset to augment.
-        :param tree: MIOSTONETree instance representing the feature hierarchy.
-        """
-        self.data = copy.deepcopy(dataset)
-        self.tree = tree
-
-        # Ensure that the dataset is normalized and one-hot encoded, but not clr-transformed
-        if not self.data.normalized:
-            self.data.normalize()
-        if not self.data.one_hot_encoded:
-            self.data.one_hot_encode()
-        if self.data.clr_transformed:
-            raise ValueError("Dataset must not be clr-transformed")
-
-        # Compute distances
-        self.distances = self._compute_aitchison_distances()
-
-    def _compute_aitchison_distances(self):
-        """
-        Compute the Aitchison distances between all pairs of samples in the dataset.
-        This method is used internally by the __init__ method.
-        """
-        # Aitchison distance is the Euclidean distance between the clr-transformed samples
-        distances = np.zeros((len(self.data), len(self.data)))
-        for i in range(len(self.data)):
-            for j in range(i+1, len(self.data)):
-                distances[i, j] = self._aitchison_distance(self.data.X[i], self.data.X[j])
-        return distances
-    
-    def _compute_eligible_pairs(self, min_threshold, max_threshold):
-        """
-        Compute the eligible sample pairs for Mixup based on the Aitchison distance thresholds.
-        This method is used internally by the _select_samples method.
-        
-        :param min_threshold: A float representing the minimum Aitchison distance threshold.
-        :param max_threshold: A float representing the maximum Aitchison distance threshold.
-        """
-        eligible_pairs = []
-        for i in range(len(self.data)):
-            for j in range(i+1, len(self.data)):
-                if self.distances[i, j] >= min_threshold and self.distances[i, j] <= max_threshold:
-                    eligible_pairs.append((i, j))
-        return eligible_pairs
-    
-    def _select_samples(self, eligible_pairs, num_samples):
-        """
-        Select sample pairs for Mixup without replacement. 
-        This method is used internally by the mixup method.
-
-        :param eligible_pairs: A list of eligible sample pairs for Mixup.
-        :param num_samples: The number of Mixup samples to generate.
-        :return: A list of selected sample pairs.
-        :raises ValueError: If no sample pairs are found within the distance threshold.
-        """
-        # Check if there are any eligible pairs
-        if not eligible_pairs:
-            raise ValueError("No sample pairs found with distance below the threshold")
-        
-        # Select num_samples pairs without replacement
-        selected_pairs = random.sample(eligible_pairs, num_samples)
-        return selected_pairs
-
-    def _aitchison_distance(self, x, y):
-        """
-        Compute the Aitchison distance between two samples. 
-        This method is used internally by the _compute_aitchison_distances method.
-
-        :param x: A numpy array representing the first sample.
-        :param y: A numpy array representing the second sample.
-        :return: The Aitchison distance between the two samples.
-        """
-        x = np.log(x) - np.log(x).mean()
-        y = np.log(y) - np.log(y).mean()
-        return np.linalg.norm(x - y, ord=2)
-    
-    def _aitchison_addition(self, x, v):
-        """
-        Compute the Aitchison addition between two samples. 
-        This method is used internally by the _mixup_samples method.
-
-        :param x: A numpy array representing the first sample.
-        :param v: A numpy array representing the second sample.
-        :return: The Aitchison addition between the two samples.
-        """
-        sum_xv = np.sum(x * v)
-        return (x * v) / sum_xv
-
-    def _aitchison_scalar_multiplication(self, lam, x):
-        """
-        Compute the Aitchison scalar multiplication between a scalar and a sample. 
-        This method is used internally by the _mixup_samples method.
-
-        :param lam: A float representing the scalar.
-        :param x: A numpy array representing the sample.
-        :return: The Aitchison scalar multiplication between the scalar and the sample.
-        """
-        sum_xtolam = np.sum(x ** lam)
-        return (x ** lam) / sum_xtolam
-
-    def _mixup_samples(self, idx1, idx2, lam):
-        # Select the pair of samples
-        x1, y1 = self.data[idx1]
-        x2, y2 = self.data[idx2]
-
-        # Compute Aitchison mixup
-        mixed_x = self._aitchison_addition(self._aitchison_scalar_multiplication(lam, x1), self._aitchison_scalar_multiplication(1-lam, x2))
-        mixed_y = lam * y1 + (1 - lam) * y2
-        return mixed_x, mixed_y
-
-    def mixup(self, min_threshold, max_threshold, num_samples, alpha=0.4):
-        """
-        Perform Mixup augmentation on the dataset. Mixup is applied to pairs of samples 
-        that are within the specified Aitchison distance thresholds.
-
-        :param min_threshold: A float representing the minimum Aitchison distance for selecting sample pairs.
-        :param max_threshold: A float representing the maximum Aitchison distance for selecting sample pairs.
-        :param num_samples: The number of Mixup samples to generate.
-        :param alpha: The alpha parameter for the Beta distribution. Defaults to 0.4.
-        :return: An augmented MIOSTONEDataset instance.
-        :raises ValueError: If no sample pairs are found within the distance threshold.
-        """
-        # Compute eligible pairs
-        eligible_pairs = self._compute_eligible_pairs(min_threshold, max_threshold)
-
-        # Mixup samples
-        mixed_xs, mixed_ys = [], []
-        selected_pairs = self._select_samples(eligible_pairs, num_samples)
-        for idx1, idx2 in selected_pairs:
-            lam = np.random.beta(alpha, alpha)
-            mixed_x, mixed_y = self._mixup_samples(idx1, idx2, lam)
-            mixed_xs.append(mixed_x)
-            mixed_ys.append(mixed_y)
-
-        self.data.X = np.vstack((self.data.X, np.array(mixed_xs)))
-        self.data.y = np.vstack((self.data.y, np.array(mixed_ys)))
-
-        self.data.clr_transform()
-
-        return self.data
-    
-    def _select_subtree(self, num_subtrees):
-        """
-        Select subtrees from the tree with probability proportional to their depth.
-        This method is used internally by the cutmix method.
-
-        :param num_subtrees: The number of subtrees to select.
-        :return: A list of selected subtrees.
-        """
-        # Select a node from the subtree with probability proportional to its depth
-        subtree_nodes = []
-        available_nodes = list(self.tree.ete_tree.leaves())
-
-        for _ in range(num_subtrees):
-            selected_node = random.choices(available_nodes, weights=[self.tree.depths[node.name] for node in available_nodes])[0]
-            subtree_nodes.append(selected_node)
-
-            # Remove the selected node and its ancestors and descendants from the available nodes
-            for node in selected_node.ancestors():
-                if node in available_nodes:
-                    available_nodes.remove(node)
-            for node in selected_node.descendants():
-                if node in available_nodes:
-                    available_nodes.remove(node)
-
-        return subtree_nodes
-    
-    def _cutmix_with_subtree(self, idx1, idx2, subtree_nodes):
-        """
-        Perform Cutmix on a pair of samples by swapping the data of leaves in the specified subtrees.
-        This method is used internally by the cutmix method.
-
-        :param idx1: The index of the first sample.
-        :param idx2: The index of the second sample.
-        :param subtree_nodes: A list of nodes in the tree representing the subtrees to swap.
-        :return: The swapped samples.
-        """
-        # Select the pair of samples
-        x1, y1 = self.data[idx1]
-        x2, y2 = self.data[idx2]
-
-        num_swapped_leaves = 0
-        for node in subtree_nodes:
-            # Find the index of leaves in the subtree
-            leaf_names = [leaf_name for leaf_name in node.leaf_names()]
-            leaf_idx = [self.data.features.tolist().index(leaf_name) for leaf_name in leaf_names]
-            num_swapped_leaves += len(leaf_idx)
-            # Swap the data of the tip nodes
-            x1_orig, x2_orig = x1[leaf_idx].copy(), x2[leaf_idx].copy()
-            x1[leaf_idx], x2[leaf_idx] = x2_orig, x1_orig
-            # Rescale the swapped data to ensure that the sum of values is the same as the original
-            x1[leaf_idx] = x1[leaf_idx] * x1_orig.sum() / x1[leaf_idx].sum()
-            x2[leaf_idx] = x2[leaf_idx] * x2_orig.sum() / x2[leaf_idx].sum()
-
-        # Compute the new labels
-        y1 = y1 * (1 - num_swapped_leaves / len(self.data.features)) + y2 * (num_swapped_leaves / len(self.data.features))
-        y2 = y2 * (1 - num_swapped_leaves / len(self.data.features)) + y1 * (num_swapped_leaves / len(self.data.features))
-        
-        return x1, y1, x2, y2
-    
-    def cutmix(self, min_threshold, max_threshold, num_samples, num_subtrees):
-        """
-        Perform Cutmix augmentation on the dataset. Cutmix is applied by swapping subtrees between pairs 
-        of samples that are within the specified Aitchison distance thresholds.
-        
-        :param min_threshold: A float representing the minimum Aitchison distance for selecting sample pairs.
-        :param max_threshold: A float representing the maximum Aitchison distance for selecting sample pairs.
-        :param num_samples: The number of Cutmix samples to generate.
-        :param num_subtrees: The number of subtrees to swap between each pair of samples.
-        :return: An augmented MIOSTONEDataset instance.
-        :raises ValueError: If no sample pairs are found within the distance threshold.
-        """
-        # Compute eligible pairs
-        eligible_pairs = self._compute_eligible_pairs(min_threshold, max_threshold)
-
-        # Cutmix samples
-        mixed_xs, mixed_ys = [], []
-        selected_pairs = self._select_samples(eligible_pairs, num_samples // 2)
-        for idx1, idx2 in selected_pairs:
-            # Select a subtree
-            subtree_nodes = self._select_subtree(num_subtrees)
-            # Cutmix the samples
-            mixed_x1, mixed_y1, mixed_x2, mixed_y2 = self._cutmix_with_subtree(idx1, idx2, subtree_nodes)
-            mixed_xs.append(mixed_x1)
-            mixed_ys.append(mixed_y1)
-            mixed_xs.append(mixed_x2)
-            mixed_ys.append(mixed_y2)
-
-        self.data.X = np.vstack((self.data.X, np.array(mixed_xs)))
-        self.data.y = np.vstack((self.data.y, np.array(mixed_ys)))
-
-        self.data.clr_transform()
-
-        return self.data

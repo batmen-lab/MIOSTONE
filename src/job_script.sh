@@ -27,8 +27,8 @@ args="${lines[$SLURM_ARRAY_TASK_ID]}"
 # Determine which script to run
 if [[ $args_file == 'train_args.txt' ]]; then
     # Run train.py
-    srun python train.py $args
+    python train.py $args
 else
     # Run transfer_learning.py
-    srun python transfer_learning.py $args
+    python transfer_learning.py $args
 fi

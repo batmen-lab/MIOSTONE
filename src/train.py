@@ -1,6 +1,6 @@
 import argparse
-import copy
 import json
+import os
 import pickle
 import time
 from datetime import datetime
@@ -8,18 +8,19 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-from lightning.fabric.utilities.seed import seed_everything
 from lightning.pytorch import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.callbacks import Timer
+from lightning.pytorch.loggers import TensorBoardLogger
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (MulticlassAccuracy, MulticlassAUROC,
                                          MulticlassAveragePrecision)
 
 from baseline import MLP, PopPhyCNN, TaxoNN
-from data import MIOSTONEDataset, MIOSTONEMixup
+from data import MIOSTONEDataset
+from mixup import MIOSTONEMixup
 from model import MIOSTONEModel
 from pipeline import Pipeline
 
@@ -43,13 +44,20 @@ class DataModule(LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers)
     
 class Classifier(LightningModule):
-    def __init__(self, model, class_weight):
+    def __init__(self, model, class_weight, metrics):
         super().__init__()
         self.model = model
         self.train_criterion = nn.CrossEntropyLoss(weight=class_weight)
         self.val_criterion = nn.CrossEntropyLoss()
-        self.test_true_labels = []
-        self.test_logits = []
+        self.metrics = metrics
+        self.validation_step_outputs = []
+        self.test_step_outputs = []
+
+        # Initialize lists to store logits and labels
+        self.epoch_val_logits = []
+        self.epoch_val_labels = []
+        self.test_logits = None
+        self.test_labels = None
         
     def forward(self, x):
         return self.model(x)
@@ -59,34 +67,54 @@ class Classifier(LightningModule):
         logits = self.model(X)
         loss = self.train_criterion(logits, y)
         l0_reg = self.model.get_total_l0_reg()
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_l0_reg', l0_reg, on_step=True, on_epoch=True, prog_bar=True)
-
-        return loss + l0_reg
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
     
+        return loss + l0_reg
+
     def validation_step(self, batch, batch_idx):
         X, y = batch
         logits = self.model(X)
         loss = self.val_criterion(logits, y)
         l0_reg = self.model.get_total_l0_reg()
-        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('val_l0_reg', l0_reg, on_step=True, on_epoch=True, prog_bar=True)
+        self.validation_step_outputs.append({'logits': logits, 'labels': y})
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        # Calculate metrics
+        self.metrics.to(logits.device)
+        scores = self.metrics(logits, y)
+        for key, value in scores.items():
+            self.log(f'val_{key}', value, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         return loss + l0_reg
+    
+    def on_validation_epoch_end(self):
+        outputs = self.validation_step_outputs
+        logits = torch.cat([x['logits'] for x in outputs], dim=0)
+        labels = torch.cat([x['labels'] for x in outputs], dim=0)
+
+        # Store logits and labels
+        self.epoch_val_logits.append(logits.detach().cpu().numpy().tolist())
+        self.epoch_val_labels.append(labels.detach().cpu().numpy().tolist())
+
+        # Reset validation step outputs
+        self.validation_step_outputs = []
 
     def test_step(self, batch, batch_idx):
         X, y = batch
         logits = self.model(X)
+        self.test_step_outputs.append({'logits': logits, 'labels': y})
+    
+    def on_test_epoch_end(self):
+        outputs = self.test_step_outputs
+        logits = torch.cat([x['logits'] for x in outputs], dim=0)
+        labels = torch.cat([x['labels'] for x in outputs], dim=0)
 
-        # Store true labels and logits
-        self.test_true_labels.append(y.detach().cpu())
-        self.test_logits.append(logits.detach().cpu())
+        # Store logits and labels
+        self.test_logits = logits.detach().cpu().numpy().tolist()
+        self.test_labels = labels.detach().cpu().numpy().tolist()
 
-    def get_test_results(self):
-        test_true_labels = torch.cat(self.test_true_labels, dim=0)
-        test_logits = torch.cat(self.test_logits, dim=0)
-
-        return test_true_labels, test_logits
+        # Reset test step outputs
+        self.test_step_outputs = []
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters())
@@ -98,6 +126,14 @@ class TrainingPipeline(Pipeline):
         self.model_hparams = {}
         self.train_hparams = {}
         self.mixup_hparams = {}
+        self.output_subdir = None
+
+    def _create_output_subdir(self):
+        self.pred_dir = self.output_dir + 'predictions/'
+        self.model_dir = self.output_dir + 'models/'
+        for dir in [self.pred_dir, self.model_dir]:
+            if not os.path.exists(dir):
+                os.makedirs(dir)
 
     def _create_subset(self, data, indices, normalize=True, one_hot_encoding=True, clr=True):
         X_subset = data.X[indices]
@@ -119,18 +155,14 @@ class TrainingPipeline(Pipeline):
     
         return augmented_dataset
 
-    def _create_classifier(self, train_dataset):
+    def _create_classifier(self, train_dataset, metrics):
         in_features = train_dataset.X.shape[1]
         out_features = train_dataset.num_classes
         class_weight = train_dataset.class_weight if self.train_hparams['class_weight'] == 'balanced' else [1] * out_features
 
         if self.model_type == 'rf':
             class_weight = {key: value for key, value in enumerate(class_weight)}
-            if self.model is not None:
-                classier = copy.deepcopy(self.model)
-                classifier = classier.set_params(class_weight=class_weight)
-            else:
-                classifier = RandomForestClassifier(class_weight=class_weight, random_state=self.seed, warm_start=True)
+            classifier = RandomForestClassifier(class_weight=class_weight, random_state=self.seed, warm_start=True)
         else:
             class_weight = torch.tensor(class_weight).float()
             if self.model_type == 'mlp':
@@ -143,77 +175,82 @@ class TrainingPipeline(Pipeline):
                 model = MIOSTONEModel(self.tree, out_features, **self.model_hparams)
             else:
                 raise ValueError(f"Invalid model type: {self.model_type}")
-            if self.model is not None:
-                model.load_state_dict(self.model.state_dict())
     
-            classifier = Classifier(model, class_weight)
+            classifier = Classifier(model, class_weight, metrics)
 
         return classifier
 
-    def _run_training(self, classifier, train_dataset, test_dataset):
-        time_elapsed = 0
+    def _run_rf_training(self, classifier, train_dataset, test_dataset):
+        start_time = time.time()
+        classifier.fit(train_dataset.X, train_dataset.y)
+        time_elapsed = time.time() - start_time
+
+        test_labels = test_dataset.y.tolist()
+        test_logits = classifier.predict_proba(test_dataset.X).tolist()
+
+        return {
+            'test_labels': test_labels,
+            'test_logits': test_logits,
+            'time_elapsed': time_elapsed,
+        }
+
+    def _run_other_training(self, classifier, train_dataset, val_dataset, test_dataset, filename):
+        timer = Timer()
+        logger = TensorBoardLogger(self.output_dir + 'logs/', name=filename)
+        data_module = DataModule(train_dataset, val_dataset, test_dataset, batch_size=self.train_hparams['batch_size'], num_workers=1)
+
+        trainer = Trainer(
+            max_epochs=self.train_hparams['max_epochs'],
+            enable_progress_bar=True, 
+            enable_model_summary=False,
+            enable_checkpointing=False,
+            log_every_n_steps=1,
+            logger=logger,
+            callbacks=[timer],
+            accelerator='gpu',
+            devices=1,
+            deterministic=True,
+        )
+        trainer.fit(classifier, datamodule=data_module)
+        trainer.test(classifier, datamodule=data_module)
+
+        return {
+            'epoch_val_labels': classifier.epoch_val_labels,
+            'epoch_val_logits': classifier.epoch_val_logits,
+            'test_labels': classifier.test_labels,
+            'test_logits': classifier.test_logits,
+            'time_elapsed': timer.time_elapsed('train')
+        }
+
+    def _run_training(self, classifier, train_dataset, val_dataset, test_dataset, filename):
         if self.model_type == 'rf':
-            if self.train_hparams['max_epochs'] > 0:
-                start_time = time.time()
-                classifier.fit(train_dataset.X, train_dataset.y)
-                time_elapsed = time.time() - start_time
-            test_true_labels = torch.tensor(test_dataset.y)
-            test_logits = torch.tensor(classifier.predict_proba(test_dataset.X))
+            return self._run_rf_training(classifier, train_dataset, test_dataset)
         else:
-            data_module = DataModule(train_dataset, test_dataset, test_dataset, batch_size=self.train_hparams['batch_size'], num_workers=1)
-            timer = Timer()
-            trainer = Trainer(max_epochs=self.train_hparams['max_epochs'],
-                              enable_progress_bar=True, 
-                              enable_model_summary=False,
-                              enable_checkpointing=False,
-                              log_every_n_steps=1,
-                              callbacks=[timer],
-                              accelerator='gpu')
-            trainer.fit(classifier, datamodule=data_module)
-            trainer.test(classifier, datamodule=data_module)
-            test_true_labels, test_logits = classifier.get_test_results()
-            time_elapsed = timer.time_elapsed('train')
-
-        return test_true_labels, test_logits, time_elapsed
+            return self._run_other_training(classifier, train_dataset, val_dataset, test_dataset, filename)
     
-    def _save_model(self, classifier, filename):
-        models_dir = self.output_dir + 'models/'
+    def _save_model(self, classifier, save_dir, filename):
         if self.model_type == 'rf':
-            pickle.dump(classifier, open(models_dir + filename + '.pkl', 'wb'))
+            pickle.dump(classifier, open(save_dir + filename + '.pkl', 'wb'))
         else:
-            torch.save(classifier.model.state_dict(), models_dir + filename + '.pt')
+            torch.save(classifier.model.state_dict(), save_dir + filename + '.pt')
     
-    def _save_result(self, result, filename):
-        results_dir = self.output_dir + 'results/'
-        with open(results_dir + filename + '.json', 'w') as f:
-            json.dump(result, f, indent=4)
-
-    def _compute_metrics(self, metrics, test_logits, test_labels):
-        metrics(test_logits, test_labels)
-        metrics_result = metrics.compute()
-        metrics.reset()
-        return metrics_result
-
-    def _compute_mean_std_cv_scores(self, metrics, overall_test_true_labels, overall_test_logits):
-        metrics_per_fold = [self._compute_metrics(metrics, logits, labels)
-                            for logits, labels in zip(overall_test_logits, overall_test_true_labels)]
-
-        mean_metrics = np.mean([list(metrics.values()) for metrics in metrics_per_fold], axis=0)
-        std_metrics = np.std([list(metrics.values()) for metrics in metrics_per_fold], axis=0)
-        metrics_summary = {key: (mean, std) for key, mean, std in zip(metrics_per_fold[0].keys(), mean_metrics, std_metrics)}
-
-        print("Mean CV Scores:")
-        for metric, (mean, std) in metrics_summary.items():
-            print(f"{metric}: Mean = {mean:.4f}, Std = {std:.4f}")
-
-    def _compute_global_cv_scores(self, metrics, overall_test_true_labels, overall_test_logits):
-        overall_test_logits = torch.cat(overall_test_logits, dim=0)
-        overall_test_true_labels = torch.cat(overall_test_true_labels, dim=0)
-        global_metrics = self._compute_metrics(metrics, overall_test_logits, overall_test_true_labels)
-        
-        print("Global CV Scores:")
-        for metric, value in global_metrics.items():
-            print(f"{metric}: {value:.4f}")
+    def _save_result(self, result, save_dir, filename):
+        with open(save_dir + filename + '.json', 'w') as f:
+            result_to_save = {
+                'Seed': self.seed,
+                'Fold': filename.split('_')[1],
+                'Model Type': self.model_type,
+                'Model Hparams': self.model_hparams,
+                'Train Hparams': self.train_hparams,
+                'Mixup Hparams': self.mixup_hparams,
+                'Test Labels': result['test_labels'],
+                'Test Logits': result['test_logits'],
+                'Time Elapsed': result['time_elapsed']
+            }
+            if self.model_type != 'rf':
+                result_to_save['Epoch Val Labels'] = result['epoch_val_labels']
+                result_to_save['Epoch Val Logits'] = result['epoch_val_logits']
+            json.dump(result_to_save, f, indent=4)
 
     def _train(self):
         # Check if data and tree are loaded
@@ -229,63 +266,69 @@ class TrainingPipeline(Pipeline):
         })
         
         # Define cross-validation strategy
-        skf = StratifiedKFold(n_splits=self.train_hparams['k_folds'], shuffle=True, random_state=self.seed)
+        # kf = StratifiedKFold(n_splits=self.train_hparams['k_folds'], shuffle=True, random_state=self.seed)
+        kf = KFold(n_splits=self.train_hparams['k_folds'], shuffle=True, random_state=self.seed)
 
         # Training loop
-        overall_test_true_labels = []
-        overall_test_logits = []
-        for fold, (train_index, test_index) in enumerate(skf.split(self.data.X, self.data.y)):
-            # Reset the seed for reproducibility
-            seed_everything(self.seed)
-
+        fold_test_labels = []
+        fold_test_logits = []
+        for fold, (train_index, test_index) in enumerate(kf.split(self.data.X, self.data.y)):
             # Prepare datasets
             one_hot_encoding = True if self.mixup_hparams else False
             clr = False if self.model_type == 'popphycnn' else True
-            train_dataset = self._create_subset(self.data, train_index, one_hot_encoding=one_hot_encoding, clr=clr)
-            test_dataset = self._create_subset(self.data, test_index, one_hot_encoding=False, clr=clr)
+            train_dataset = self._create_subset(self.data, 
+                                                train_index, 
+                                                normalize=False,
+                                                one_hot_encoding=one_hot_encoding, 
+                                                clr=clr)
+            test_dataset = self._create_subset(self.data, 
+                                               test_index, 
+                                               normalize=False,
+                                               one_hot_encoding=False, 
+                                               clr=clr)
 
             # Apply MIOSTONEMixup if specified
             if self.mixup_hparams:
                 train_dataset = self._apply_mixup(train_dataset)
 
             # Create classifier 
-            classifier = self._create_classifier(train_dataset)
+            classifier = self._create_classifier(train_dataset, metrics)
 
-            # Convert the datasets to tree matrices if necessary
+            # Convert to tree matrix if specified and apply standardization
             if self.model_type == 'popphycnn':
                 scaler = train_dataset.to_tree_matrix(self.tree)
                 test_dataset.to_tree_matrix(self.tree, scaler=scaler)
+            else:
+                scaler = train_dataset.standardize()
+                test_dataset.standardize(scaler=scaler)
+
+            # Set filename
+            filename = f"{self.seed}_{fold}_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
             # Run training
-            test_true_labels, test_logits, time_elapsed = self._run_training(classifier, train_dataset, test_dataset)
-            overall_test_true_labels.append(test_true_labels)
-            overall_test_logits.append(test_logits)
-
-            # Save test results
-            result = {
-                'Seed': self.seed,
-                'Fold': fold,
-                'Model Type': self.model_type,
-                'Model Hparams': self.model_hparams,
-                'Train Hparams': self.train_hparams,
-                'Mixup Hparams': self.mixup_hparams,
-                'True Labels': test_true_labels.numpy().tolist(), 
-                'Logits': test_logits.numpy().tolist(),
-                'Time Elapsed': time_elapsed,
-            }
-
+            result = self._run_training(classifier, train_dataset, test_dataset, test_dataset, filename)
+            fold_test_labels.append(torch.tensor(result['test_labels']))
+            fold_test_logits.append(torch.tensor(result['test_logits']))
+                     
             # Save results and model
-            filename = f"{self.seed}_{fold}_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self._save_result(result, filename)
-            self._save_model(classifier, filename)
+            self._save_result(result, self.pred_dir, filename)
+            # self._save_model(classifier, self.model_dir, filename)
 
-        # Compute CV scores
-        self._compute_mean_std_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
-        self._compute_global_cv_scores(metrics, overall_test_true_labels, overall_test_logits)
+        # Calculate metrics
+        test_labels = torch.cat(fold_test_labels, dim=0)
+        test_logits = torch.cat(fold_test_logits, dim=0)
+        metrics.to(test_labels.device)
+        test_scores = metrics(test_logits, test_labels)
+        print(f"Test scores:")
+        for key, value in test_scores.items():
+            print(f"{key}: {value.item()}")
 
     def run(self, dataset, target, model_type, *args, **kwargs):
         # Load data and tree
         self._load_data_and_tree(dataset, target, preprocess=False)
+
+        # Create output directory
+        self._create_output_subdir()
 
         # Configure default model parameters
         self.model_type = model_type
@@ -307,7 +350,7 @@ class TrainingPipeline(Pipeline):
         # Configure default training parameters
         self.train_hparams['k_folds'] = 5
         self.train_hparams['batch_size'] = 512
-        self.train_hparams['max_epochs'] = 200
+        self.train_hparams['max_epochs'] = 100
         self.train_hparams['class_weight'] = 'balanced'
 
         # Configure default mixup parameters

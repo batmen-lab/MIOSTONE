@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,7 +18,13 @@ class AttributionPipeline(Pipeline):
     def __init__(self, seed):
         super().__init__(seed)
         self.internal_attributions = {}
-        self.leaf_attributions = {}        
+        self.leaf_attributions = {}      
+
+    def _create_output_subdir(self):
+        super()._create_output_subdir()
+        self.attributions_dir = self.output_dir + 'attributions/'
+        if not os.path.exists(self.attributions_dir):
+            os.makedirs(self.attributions_dir)  
 
     def _load_attributions(self):
         with open(f"{self.output_dir}/attributions/internal_attributions.json", "r") as f:
@@ -133,7 +140,7 @@ class AttributionPipeline(Pipeline):
         self._configure_leaf_colors(leaf_colors)
 
         # Render tree
-        image_path = f"{self.output_dir}/attributions/tree.png"
+        image_path = f"{self.attributions_dir}/tree.png"
         self.tree.ete_tree.render(image_path, tree_style=ts, h=2400, units="px", dpi=1200)
         plt.figure(figsize=(15, 15))
         plt.axis('off')

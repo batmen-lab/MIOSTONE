@@ -10,7 +10,7 @@ class DeterministicGate(nn.Module):
         self.values = values
     
     def forward(self, x):
-        return x * self.values, torch.tensor(0.0).to(self.values.device)
+        return x * self.values, torch.tensor(0.0).to(x.device)
     
     def get_gate_values(self):
         return self.values

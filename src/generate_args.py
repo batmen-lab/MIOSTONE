@@ -1,12 +1,11 @@
 import itertools
-import os
 
 # Possible values for each argument
 seeds = range(10)
-datasets = ['ibd200', 'alzbiom', 'asd', 'hmp2']
-targets = ['type', 'ad', 'stage']
-model_types = ['rf', 'mlp', 'taxonn', 'popphycnn', 'miostone']
-tl_epochs = [0, 25, 50, 75, 100]
+datasets = ['ibd200']
+targets = ['type']
+model_types = ['miostone', 'mlp', 'taxonn', 'popphycnn']
+num_epochs = [0, 20, 40, 60, 80, 100]
 
 # Function to validate that the combination of arguments for training is valid
 def validate_train_args(combination):
@@ -27,12 +26,12 @@ def validate_train_args(combination):
         return False
     return True
 
-# Function to validate that the combination of arguments for transfer learning is valid
 def validate_transfer_learning_args(combination):
-    seed, model_type, tl_epochs = combination
-    if model_type == 'rf' and tl_epochs != 0:
+    seed, model_type, num_epochs = combination
+    if model_type == 'rf' and num_epochs != 0:
         return False
-    return True
+    else:
+        return True
 
 # Generate the commands and write them to a file
 with open('train_args.txt', 'w') as f:
@@ -43,10 +42,10 @@ with open('train_args.txt', 'w') as f:
         f.write(command + '\n')
 
 with open('transfer_learning_args.txt', 'w') as f:
-    for combination in itertools.product(seeds, model_types, tl_epochs):
+    for combination in itertools.product(seeds, model_types, num_epochs):
         if not validate_transfer_learning_args(combination):
             continue
-        command = f"--seed {combination[0]} --dataset ibd200 --pretrain_dataset hmp2 --target type --model_type {combination[1]} --tl_epochs {combination[2]}"
+        command = f"--seed {combination[0]} --dataset ibd200 --pretrain_dataset hmp2 --target type --model_type {combination[1]} --num_epochs {combination[2]}"
         f.write(command + '\n')
     
 

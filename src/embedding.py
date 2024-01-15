@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,6 +17,11 @@ class EmbeddingPipeline(Pipeline):
     def __init__(self, seed):
         super().__init__(seed)
         self.reducers = {"pca": PCA(random_state=seed), "tsne": TSNE(random_state=seed), "umap": umap.UMAP(random_state=seed)}
+
+    def _create_output_subdir(self):
+        self.embedding_dir = self.output_dir + 'embeddings/'
+        if not os.path.exists(self.embedding_dir):
+            os.makedirs(self.embedding_dir)
 
     def _capture_embeddings(self):
         # Ensure that the model and data are properly set up
@@ -69,7 +75,7 @@ class EmbeddingPipeline(Pipeline):
             ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(f"{self.output_dir}/embeddings/{reducer}.png")
+        plt.savefig(f"{self.embedding_dir}/{reducer}.png")
         plt.show()
 
     def _plot_embeddings_with_labels(self, reduced_embeddings, labels, title, ax):
