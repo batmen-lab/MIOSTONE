@@ -3,7 +3,7 @@ Source code for **MIOSTONE: Modeling microbiome-trait associations with taxonomy
 
 ## Dataset
 
-Access the datasets used in **MIOSTONE** here: [Link to datasets](https://drive.google.com/file/d/13A5OPZjv6DRPpjChz8MaKXcAEqG-CPeF/view?usp=sharing). Please download the file and unzip it in the root directory of the project.
+Please unzip the `data.tat.xz` file and put the `data` directory in the same directory as the `src` directory.
 
 ## Example Notebook
 
@@ -11,4 +11,8 @@ An example jupyter notebook is provided in the `example` directory. Please follo
 
 ## Requirements
 
-Required packages are listed in `requirements.txt`. Please install them before running **MIOSTONE**.
+Required packages are listed in `environment.yml`. You can create a conda environment with the following command:
+
+```bash
+conda env create -f environment.yml
+```

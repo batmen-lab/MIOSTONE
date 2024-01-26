@@ -1,160 +1,285 @@
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-from captum.module import (BinaryConcreteStochasticGates,
-                           GaussianStochasticGates)
+import torch.nn.utils.prune as prune
+from captum.module import BinaryConcreteStochasticGates, GaussianStochasticGates
+
+class MIOSTONELayer(nn.Module):
+    def __init__(self, 
+                 in_features, 
+                 out_features, 
+                 gate_type, 
+                 gate_param,
+                 connections,
+                 prune_mode):
+        super(MIOSTONELayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gate_type = gate_type
+        self.gate_param = gate_param
+        self.connections = connections
+        self.prune_mode = prune_mode
+        self.x_linear = None
+        self.l0_reg = None
+
+        # Initialize the layer
+        self._init_layer()
+
+    def _init_layer(self):
+        # MLP layer
+        self.mlp = nn.Sequential(
+            nn.Linear(self.in_features, self.out_features),
+            nn.LeakyReLU()
+        )
+        # Linear layer
+        self.linear = nn.Sequential(
+            nn.Linear(self.in_features, self.out_features),
+        )
+
+        # Gate layer
+        if self.gate_type == "concrete":
+            self.gate_mask = self._generate_gate_mask()
+            self.gate_layer = BinaryConcreteStochasticGates(n_gates=len(self.connections),
+                                                           mask=self.gate_mask,
+                                                           temperature=self.gate_param)
+        elif self.gate_type == "gaussian":
+            self.gate_mask = self._generate_gate_mask()
+            self.gate_layer = GaussianStochasticGates(n_gates=len(self.connections),
+                                                        mask=self.gate_mask,
+                                                        std=self.gate_param)
+            
+        # Prune the network based on the connections
+        self._apply_pruning()
 
 
-class DeterministicGate(nn.Module):
-    def __init__(self, values):
-        super().__init__()
-        self.values = values
-    
-    def forward(self, x):
-        return x * self.values, torch.tensor(0.0).to(self.values.device)
-    
-    def get_gate_values(self):
-        return self.values
+    def _generate_gate_mask(self):
+        mask = torch.zeros(self.out_features, dtype=torch.int64)
+        value = 0
+        for _, output_indices in self.connections.values():
+            for output_index in output_indices:
+                mask[output_index] = value
+            value += 1
 
-class TreeNode(nn.Module):
-    def __init__(self, name, device,
-                 input_dim, output_dim, 
-                 gate_type, gate_param):
-        super().__init__()
-        self.name = name
-        self.input_dim = input_dim
-        self.output_dim = output_dim
+        return mask
 
-        self.mlp_embedding_layer = nn.Sequential(nn.Linear(self.input_dim, self.output_dim), nn.ReLU())
-        self.linear_embedding_layer = nn.Linear(self.input_dim, self.output_dim)
+    def _apply_pruning(self):
+        # If the prune mode is random, generate random connections
+        if self.prune_mode == "random":
+            self._generate_random_connections()
+        # Define a custom prune method for each layer
+        prune.custom_from_mask(self.mlp[0], name='weight', mask=self._generate_pruning_mask())
+        prune.custom_from_mask(self.linear[0], name='weight', mask=self._generate_pruning_mask())
+        # Remove the original weight parameter
+        prune.remove(self.mlp[0], 'weight')
+        prune.remove(self.linear[0], 'weight')
 
-        if gate_type == 'gaussian':
-            self.gate = GaussianStochasticGates(n_gates=1, mask=torch.tensor([0]).to(device), std=gate_param)
-        elif gate_type == 'concrete':
-            self.gate = BinaryConcreteStochasticGates(n_gates=1, mask=torch.tensor([0]).to(device), temperature=gate_param)
-        elif gate_type == 'deterministic':
-            self.gate = DeterministicGate(torch.tensor(gate_param).to(device))
+    def _generate_random_connections(self):
+        connections = {}
+        all_input_indices = [mapping[0] for mapping in self.connections.values()]
+        for ete_node, (_, output_indices) in self.connections.items():
+            idx = random.randint(0, len(all_input_indices) - 1)
+            input_indices = all_input_indices[idx]
+            connections[ete_node] = (input_indices, output_indices)
+            all_input_indices = all_input_indices[:idx] + all_input_indices[idx + 1:]
+
+        self.connections = connections
+
+    def _generate_pruning_mask(self):
+        # Start with a mask of all zeros (all connections pruned)
+        mask = torch.zeros((self.out_features, self.in_features), dtype=torch.int64)
+
+        # Iterate over the connections at the current depth and set the corresponding elements in the mask to 1
+        for input_indices, output_indices in self.connections.values():
+            for input_index in input_indices:
+                for output_index in output_indices:
+                    mask[output_index, input_index] = 1
+
+        return mask
+
+    def forward(self, x, x_linear):
+        # Apply the MLP layer
+        x_mlp = self.mlp(x)
+
+        # Apply the linear layer
+        self.x_linear = self.linear(x_linear)
+        
+        # Apply the linear layer with the gate values
+        if self.gate_type == "deterministic":
+            gate_values = self.gate_param
+            self.l0_reg = torch.tensor(0.0).to(x.device)
         else:
-            raise ValueError(f"Invalid gate type: {gate_type}")
+            input_size = x_mlp.size()
+            batch_size = input_size[0]
 
-    def forward(self, children_embeddings_mlp, children_embeddings_linear):
-        # Compute the node embedding 
-        node_embedding_mlp = self.mlp_embedding_layer(children_embeddings_mlp)
-        node_embedding_linear = self.linear_embedding_layer(children_embeddings_linear)
-        self.node_embedding_linear = node_embedding_linear
-       
-        # Compute the gate values
-        gated_node_embedding_mlp, l0_reg = self.gate(node_embedding_mlp)
-        self.l0_reg = l0_reg
-        
-        # Compute the gated node embedding
-        gated_node_embedding = gated_node_embedding_mlp + (1 - self.gate.get_gate_values()) * node_embedding_linear
+            gate_values = self.gate_layer._sample_gate_values(batch_size)
 
-        return gated_node_embedding
-    
-    def get_node_embedding_linear(self):
-        return self.node_embedding_linear
-    
-    def get_l0_reg(self):
-        return self.l0_reg
+            # hard-sigmoid rectification z=min(1,max(0,_z))
+            gate_values = torch.clamp(gate_values, min=0, max=1)
 
-        
-class TreeNN(nn.Module):
-    def __init__(self, device, ete_tree, node_min_dim, 
-                 node_dim_func, node_dim_func_param,
-                 node_gate_type, node_gate_param, 
-                 output_dim, output_depth, output_truncation):
-        super().__init__()
-        self.device = device
-        self.ete_tree = ete_tree
+            # use expand_as not expand/broadcast_to which do not work with torch.fx
+            input_mask = self.gate_layer.mask.expand_as(x_mlp)
+
+            # flatten all dim except batch to gather from gate values
+            flattened_mask = input_mask.reshape(batch_size, -1)
+            gate_values = torch.gather(gate_values, 1, flattened_mask)
+
+            # reshape gates(batch_size, n_elements) into input_size for point-wise mul
+            gate_values = gate_values.reshape(input_size)
+
+            prob_density = self.gate_layer._get_gate_active_probs()
+            if self.gate_layer.reg_reduction == "sum":
+                l0_reg = prob_density.sum()
+            elif self.gate_layer.reg_reduction == "mean":
+                l0_reg = prob_density.mean()
+            else:
+                l0_reg = prob_density
+
+            l0_reg *= self.gate_layer.reg_weight
+            self.l0_reg = l0_reg
+
+        # Apply the gate values
+        x_mlp_gated = gate_values * x_mlp
+        x_linear_gated = (1 - gate_values) * self.x_linear
+
+        x_gated = x_mlp_gated + x_linear_gated
+
+        return x_gated
+
+
+class MIOSTONEModel(nn.Module):
+    def __init__(self, 
+                 tree,
+                 out_features,
+                 node_min_dim,
+                 node_dim_func,
+                 node_dim_func_param, 
+                 node_gate_type,
+                 node_gate_param,
+                 prune_mode):
+        super(MIOSTONEModel, self).__init__()
+        self.out_features = out_features
         self.node_min_dim = node_min_dim
         self.node_dim_func = node_dim_func
         self.node_dim_func_param = node_dim_func_param
         self.node_gate_type = node_gate_type
         self.node_gate_param = node_gate_param
-        self.output_dim = output_dim
-        self.output_depth = output_depth
-        self.output_truncation = output_truncation
-        self.outputs = {}
-        self._build_network()
-        self._init_weights()
-        self.to(device)
+        self.prune_mode = prune_mode
+        self.hidden_layers = None
+        self.output_layer = None
+        self.total_l0_reg = None
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        # Initialize the architecture based on the tree
+        connections, layer_dims = self._init_architecture(tree)
 
-    def _build_network(self):
-        self.nodes = nn.ModuleDict()
-        self.output_nodes = []
-        self.embedding_nodes = [] 
+        # Build the model based on the architecture
+        self._build_model(connections, layer_dims)
 
+    def _init_architecture(self, tree):
         # Define the node dimension function
         def dim_func(x, node_dim_func, node_dim_func_param, depth):
             if node_dim_func == "linear":
-                max_depth = self.ete_tree.max_depth
-                coeff = node_dim_func_param ** (max_depth - depth)
+                coeff = node_dim_func_param ** (tree.max_depth - depth)
                 return int(coeff * x)
             elif node_dim_func == "const":
                 return int(node_dim_func_param)
-        
-        # Iterate over nodes in ETE Tree and build TreeNode
-        for ete_node in reversed(list(self.ete_tree.traverse("levelorder"))):
-            if ete_node.depth >= self.output_depth or not self.output_truncation:
-                # Set the input dimensions
-                children_out_dims = [self.nodes[child.name].output_dim for child in ete_node.get_children()] if not ete_node.is_leaf() else [1]
-                node_in_dim = sum(children_out_dims)
 
-                # Set the output dimensions
-                node_out_dim = max(self.node_min_dim, dim_func(len(ete_node.get_leaves()), self.node_dim_func, self.node_dim_func_param, ete_node.depth))
+        # Initialize dictionary for connections and layer dimensions
+        layer_connections = [{} for _ in range(tree.max_depth + 1)]
+        layer_dims = [None for _ in range(tree.max_depth + 1)]
 
-                # Build the node
-                tree_node = TreeNode(ete_node.name, self.device, 
-                                     node_in_dim, node_out_dim, 
-                                     self.node_gate_type, self.node_gate_param)
-                self.nodes[ete_node.name] = tree_node
-                
-                # Add the node to the output nodes if necessary
-                if ete_node.depth <= self.output_depth:
-                    self.output_nodes.append(ete_node.name)
+        curr_index = 0
+        curr_depth = tree.max_depth
+        prev_layer_out_features = 0
 
-        # Build output layer
-        output_in_dim = sum([self.nodes[output_node].output_dim for output_node in self.output_nodes])
-        self.output_layer = nn.Sequential(nn.BatchNorm1d(output_in_dim), nn.Linear(output_in_dim, self.output_dim))
+        for ete_node in reversed(list(tree.ete_tree.traverse("levelorder"))):
+            node_depth = tree.depths[ete_node.name]
+            if node_depth != curr_depth:
+                layer_dims[curr_depth] = (prev_layer_out_features, curr_index)
+                curr_depth = node_depth
+                prev_layer_out_features = curr_index
+                curr_index = 0
 
-    def forward(self, x):
-        # Initialize a dictionary to store the outputs at each node
-        self.outputs = {}
-        self.total_l0_reg = torch.tensor(0.0).to(self.device)
+            if ete_node.is_leaf:
+                layer_connections[curr_depth][ete_node.name] = ([], [curr_index])
+                curr_index += 1
+                continue
 
-        # Perform a forward pass on the leaves
-        input_split = torch.split(x, split_size_or_sections=1, dim=1)
-        for leaf_node, input in zip(self.ete_tree.get_leaves(), input_split):
-            embedding_mlp = self.nodes[leaf_node.name](input, input)
-            embedding_linear = self.nodes[leaf_node.name].get_node_embedding_linear()
-            self.outputs[leaf_node.name] = (embedding_mlp, embedding_linear)
-            self.total_l0_reg += self.nodes[leaf_node.name].get_l0_reg()
+            children = ete_node.get_children()
+
+            # Calculate input indices
+            input_indices = []
+            for child in children:
+                child_output_indices = layer_connections[node_depth + 1][child.name][1]
+                input_indices.extend(child_output_indices)
+
+            # Calculate output dimensions and indices
+            node_out_features = max(self.node_min_dim, 
+                                    dim_func(self.node_min_dim * len(list(ete_node.leaves())),
+                                            self.node_dim_func, 
+                                            self.node_dim_func_param, 
+                                            node_depth))
+            output_indices = list(range(curr_index, curr_index + node_out_features))
+            curr_index += node_out_features
+
+            # Store in connections
+            layer_connections[curr_depth][ete_node.name] = (input_indices, output_indices)
+
+        # Append the dimension of the last layer
+        layer_dims[0] = (prev_layer_out_features, curr_index)
+
+        # Remove the layer dimension of the leaf nodes
+        layer_dims = layer_dims[:-1]
+
+        return layer_connections, layer_dims
+
+    def _build_model(self, layer_connections, layer_dims):
+        # Initialize the hidden layers
+        self.hidden_layers = nn.ModuleList()
+        for depth, (in_features, out_features) in enumerate(layer_dims):
+            # Get the connections for the current layer
+            connections = layer_connections[depth]
+
+            # Initialize the layer
+            layer = MIOSTONELayer(in_features, 
+                                  out_features, 
+                                  self.node_gate_type, 
+                                  self.node_gate_param, 
+                                  connections,
+                                  prune_mode=self.prune_mode)
+            self.hidden_layers.append(layer)
             
-        # Perform a forward pass on the internal nodes in "topological order"
-        for ete_node in reversed(list(self.ete_tree.traverse("levelorder"))):
-            if not ete_node.is_leaf() and (ete_node.depth >= self.output_depth or not self.output_truncation):
-                children_outputs = [self.outputs[child.name] for child in ete_node.get_children()]
-                children_embeddings_mlp = torch.cat([output[0] for output in children_outputs], dim=1)
-                children_embeddings_linear = torch.cat([output[1] for output in children_outputs], dim=1)
-                embedding_mlp = self.nodes[ete_node.name](children_embeddings_mlp, children_embeddings_linear)
-                embedding_linear = self.nodes[ete_node.name].get_node_embedding_linear()
-                self.outputs[ete_node.name] = (embedding_mlp, embedding_linear)
-                self.total_l0_reg += self.nodes[ete_node.name].get_l0_reg()
+        # Initialize the output layer
+        output_layer_in_features = layer_dims[0][1] 
+        self.output_layer = nn.Sequential(
+            nn.BatchNorm1d(output_layer_in_features),
+            nn.Linear(output_layer_in_features, self.out_features)
+        )
     
-        # Concatenate the outputs of the output nodes
-        self.embedding = torch.cat([self.outputs[output_node][0] for output_node in self.output_nodes], dim=1)
+    def forward(self, x):
+        # Initialize the total l0 regularization
+        self.total_l0_reg = torch.tensor(0.0).to(x.device)
 
-        # Pass the tree output through the final output layer
-        preds = self.output_layer(self.embedding)
+        # Initialize the linear layer input
+        x_linear = x
 
-        return preds
+        # Iterate over the layers
+        for layer in reversed(self.hidden_layers):
+            # Apply the layer
+            x = layer(x, x_linear)
+
+            # Update the linear layer input
+            x_linear = layer.x_linear
+            layer.x_linear = None
+
+            # Update the total l0 regularization
+            self.total_l0_reg += layer.l0_reg
+            layer.l0_reg = None
+
+        # Apply the output layer
+        x = self.output_layer(x)
+
+        return x
     
     def get_total_l0_reg(self):
-        return self.total_l0_reg
+       return self.total_l0_reg
