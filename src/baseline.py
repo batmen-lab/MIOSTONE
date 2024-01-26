@@ -9,13 +9,11 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.out_features = out_features
         self.fc1 = nn.Linear(in_features, in_features // 2)
-        self.fc2 = nn.Linear(in_features // 2, in_features // 4)
-        self.output_layer = nn.Linear(in_features // 4, out_features)
+        self.output_layer = nn.Linear(in_features // 2, out_features)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
         x = self.output_layer(x)
         return x
     

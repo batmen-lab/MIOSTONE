@@ -85,18 +85,31 @@ class EmbeddingPipeline(Pipeline):
 
         ax.set_xlabel("Component 1")
         ax.set_ylabel("Component 2" if reduced_embeddings.shape[1] > 1 else "Constant")
+
+        # Remove ticks
+        ax.set_xticks([])
+        ax.set_yticks([])
+
         ax.set_title(title)
         ax.legend()
 
     def run(self, dataset, target, model_fn, reducer, *args, **kwargs):
-        self._load_data_and_tree(dataset, target)
+        self.filepaths = {
+            'data': f'../data/{dataset}/data.tsv.xz',
+            'meta': f'../data/{dataset}/meta.tsv',
+            'target': f'../data/{dataset}/{target}.py',
+            'tree': '../data/WoL2/taxonomy.nwk'
+        }
+        self._load_tree(self.filepaths['tree'])
+        self._load_data(self.filepaths['data'], self.filepaths['meta'], self.filepaths['target'], preprocess=True)
+        self._create_output_subdir()
         model_fp = f"{self.output_dir}/models/{model_fn}.pt"
-        results_fp = f"{self.output_dir}/results/{model_fn}.json"
+        results_fp = f"{self.output_dir}/predictions/{model_fn}.json"
         self._load_model(model_fp, results_fp)
         self._capture_embeddings()
         self._visualize_embeddings_across_depths(reducer)
 
-def run_embeddings_pipeline(dataset, target, model_fn, reducer, seed):
+def run_embedding_pipeline(dataset, target, model_fn, reducer, seed=42):
     pipeline = EmbeddingPipeline(seed)
     pipeline.run(dataset, target, model_fn, reducer)
 
@@ -107,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, required=True, help="Dataset to use.")
     parser.add_argument("--target", type=str, required=True, help="Target to predict.")
     parser.add_argument("--model_fn", type=str, required=True, help="Filename of the model to load.")
-    parser.add_argument("--reducer", type=str, required=True, choices=["pca", "tsne", "umap"], help="Dimensionality reduction technique to use.")
+    parser.add_argument("--reducer", type=str, default='pca', choices=["pca", "tsne", "umap"], help="Dimensionality reduction technique to use.")
     args = parser.parse_args()
 
-    run_embeddings_pipeline(args.dataset, args.target, args.model_fn, args.reducer, args.seed)
+    run_embedding_pipeline(args.dataset, args.target, args.model_fn, args.reducer, args.seed)

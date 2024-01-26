@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 
 import matplotlib.pyplot as plt
@@ -25,18 +24,6 @@ class AttributionPipeline(Pipeline):
         self.attributions_dir = self.output_dir + 'attributions/'
         if not os.path.exists(self.attributions_dir):
             os.makedirs(self.attributions_dir)  
-
-    def _load_attributions(self):
-        with open(f"{self.output_dir}/attributions/internal_attributions.json", "r") as f:
-            self.internal_attributions = json.load(f)
-        with open(f"{self.output_dir}/attributions/leaf_attributions.json", "r") as f:
-            self.leaf_attributions = json.load(f)
-
-    def _save_attributions(self):
-        with open(f"{self.output_dir}/attributions/internal_attributions.json", "w") as f:
-            json.dump(self.internal_attributions, f, indent=4)
-        with open(f"{self.output_dir}/attributions/leaf_attributions.json", "w") as f:
-            json.dump(self.leaf_attributions, f, indent=4)
 
     def _preprocess_data(self, num_samples):
         selected_indices = np.random.choice(len(self.data), num_samples, replace=False)
@@ -89,6 +76,19 @@ class AttributionPipeline(Pipeline):
     def _generate_colors(self, attributions):
         colormap = cm.YlGn
         colors = {node: to_hex(colormap(value)) for node, value in attributions.items()}
+
+        # Generate a color bar for the colormap
+        if "colorbar.pdf" not in os.listdir(self.attributions_dir):
+            fig, ax = plt.subplots(figsize=(6, 1))
+            fig.subplots_adjust(bottom=0.5)
+            cmap = cm.YlGn
+            norm = plt.Normalize(0, 1)
+            cb1 = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap),
+                                cax=ax,
+                                orientation='horizontal')
+            cb1.set_label('Feature Importance Range')
+            plt.savefig(f"{self.attributions_dir}/colorbar.pdf")
+            plt.show()
         return colors
 
     def _configure_internal_colors(self, internal_colors):
@@ -122,7 +122,7 @@ class AttributionPipeline(Pipeline):
                     print(f"\t{leaf_name}: {leaf_value}")
                     print(f"\t{leaf.up.name}")
                     i += 1
-                if i == 3:
+                if i == 2:
                     break
 
         # Generate colors
@@ -147,24 +147,27 @@ class AttributionPipeline(Pipeline):
         plt.imshow(plt.imread(image_path))
         plt.show()
 
-    def load_and_visualize(self, dataset, target):
-        self._load_data_and_tree(dataset, target)
-        self._load_attributions()
-        self._visualize()
-
     def run(self, dataset, target, model_fn, depth, num_samples, *args, **kwargs):
-        self._load_data_and_tree(dataset, target)
-        model_fp = f"{self.output_dir}/models/{model_fn}.pt"
-        results_fp = f"{self.output_dir}/results/{model_fn.replace('model', 'result')}.json"
-        self._load_model(model_fp, results_fp)
+        # Define filepaths
+        self.filepaths = {
+            'data': f'../data/{dataset}/data.tsv.xz',
+            'meta': f'../data/{dataset}/meta.tsv',
+            'target': f'../data/{dataset}/{target}.py',
+            'tree': '../data/WoL2/taxonomy.nwk',
+            "model": f"../output/{dataset}/{target}/models/{model_fn}.pt",
+            "results": f"../output/{dataset}/{target}/predictions/{model_fn}.json"
+        }
+        self._load_tree(self.filepaths['tree'])
+        self._load_data(self.filepaths['data'], self.filepaths['meta'], self.filepaths['target'])
+        self._create_output_subdir()
+        self._load_model(self.filepaths['model'], self.filepaths['results'])
         num_samples = len(self.data) if num_samples is None else num_samples
         inputs, baselines, targets = self._preprocess_data(num_samples)
         self._compute_internal_attributions(inputs, baselines, targets, depth)
         self._compute_leaf_attributions(inputs, baselines, targets)
-        self._save_attributions()
         self._visualize()
 
-def run_attribution_pipeline(dataset, target, model_fn, depth, num_samples, seed):
+def run_attribution_pipeline(dataset, target, model_fn, depth, num_samples=None, seed=42):
     pipeline = AttributionPipeline(seed)
     pipeline.run(dataset, target, model_fn, depth, num_samples)
 
@@ -174,9 +177,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, required=True, help="Dataset to use.")
     parser.add_argument("--target", type=str, required=True, help="Target to predict.")
     parser.add_argument("--model_fn", type=str, required=True, help="Model filename to use.")
-    parser.add_argument("--depth", type=int, required=True, help="Depth to visualize for internal attributions.")
+    parser.add_argument("--depth", type=int, default=4, help="Depth to visualize for internal attributions.")
     parser.add_argument("--num_samples", type=int, help="Number of samples to use for attribution. If not specified, use all samples.")
     args = parser.parse_args()
 
     run_attribution_pipeline(args.dataset, args.target, args.model_fn, args.depth, args.num_samples, args.seed)
-    # pipeline.load_and_visualize(args.dataset, args.target)

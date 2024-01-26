@@ -1,33 +1,25 @@
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-from captum.module import BinaryConcreteStochasticGates
+from captum.module import BinaryConcreteStochasticGates, GaussianStochasticGates
 
-
-class DeterministicGate(nn.Module):
-    def __init__(self, values):
-        super().__init__()
-        self.values = values
-    
-    def forward(self, x):
-        return x * self.values, torch.tensor(0.0).to(x.device)
-    
-    def get_gate_values(self):
-        return self.values
-    
 class MIOSTONELayer(nn.Module):
     def __init__(self, 
                  in_features, 
                  out_features, 
                  gate_type, 
                  gate_param,
-                 connections):
+                 connections,
+                 prune_mode):
         super(MIOSTONELayer, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.gate_type = gate_type
         self.gate_param = gate_param
         self.connections = connections
+        self.prune_mode = prune_mode
         self.x_linear = None
         self.l0_reg = None
 
@@ -38,19 +30,24 @@ class MIOSTONELayer(nn.Module):
         # MLP layer
         self.mlp = nn.Sequential(
             nn.Linear(self.in_features, self.out_features),
-            nn.ReLU(),
+            nn.LeakyReLU()
         )
         # Linear layer
-        self.linear = nn.Linear(self.in_features, self.out_features)
+        self.linear = nn.Sequential(
+            nn.Linear(self.in_features, self.out_features),
+        )
 
         # Gate layer
-        if self.gate_type == "deterministic":
-            self.gate_layer = DeterministicGate(self.gate_param)
-        elif self.gate_type == "concrete":
+        if self.gate_type == "concrete":
             self.gate_mask = self._generate_gate_mask()
             self.gate_layer = BinaryConcreteStochasticGates(n_gates=len(self.connections),
                                                            mask=self.gate_mask,
                                                            temperature=self.gate_param)
+        elif self.gate_type == "gaussian":
+            self.gate_mask = self._generate_gate_mask()
+            self.gate_layer = GaussianStochasticGates(n_gates=len(self.connections),
+                                                        mask=self.gate_mask,
+                                                        std=self.gate_param)
             
         # Prune the network based on the connections
         self._apply_pruning()
@@ -67,12 +64,26 @@ class MIOSTONELayer(nn.Module):
         return mask
 
     def _apply_pruning(self):
+        # If the prune mode is random, generate random connections
+        if self.prune_mode == "random":
+            self._generate_random_connections()
         # Define a custom prune method for each layer
         prune.custom_from_mask(self.mlp[0], name='weight', mask=self._generate_pruning_mask())
-        prune.custom_from_mask(self.linear, name='weight', mask=self._generate_pruning_mask())
+        prune.custom_from_mask(self.linear[0], name='weight', mask=self._generate_pruning_mask())
         # Remove the original weight parameter
         prune.remove(self.mlp[0], 'weight')
-        prune.remove(self.linear, 'weight')
+        prune.remove(self.linear[0], 'weight')
+
+    def _generate_random_connections(self):
+        connections = {}
+        all_input_indices = [mapping[0] for mapping in self.connections.values()]
+        for ete_node, (_, output_indices) in self.connections.items():
+            idx = random.randint(0, len(all_input_indices) - 1)
+            input_indices = all_input_indices[idx]
+            connections[ete_node] = (input_indices, output_indices)
+            all_input_indices = all_input_indices[:idx] + all_input_indices[idx + 1:]
+
+        self.connections = connections
 
     def _generate_pruning_mask(self):
         # Start with a mask of all zeros (all connections pruned)
@@ -88,21 +99,52 @@ class MIOSTONELayer(nn.Module):
 
     def forward(self, x, x_linear):
         # Apply the MLP layer
-        x = self.mlp(x)
+        x_mlp = self.mlp(x)
 
         # Apply the linear layer
         self.x_linear = self.linear(x_linear)
-
-        # Apply the gate layer
-        x, self.l0_reg = self.gate_layer(x)
         
         # Apply the linear layer with the gate values
-        gate_values = self.gate_layer.get_gate_values()
-        if isinstance(self.gate_layer, BinaryConcreteStochasticGates):
-            gate_values = torch.gather(gate_values, 0, self.gate_mask.to(gate_values.device))
-        x = x + (1 - gate_values) * self.x_linear
+        if self.gate_type == "deterministic":
+            gate_values = self.gate_param
+            self.l0_reg = torch.tensor(0.0).to(x.device)
+        else:
+            input_size = x_mlp.size()
+            batch_size = input_size[0]
 
-        return x
+            gate_values = self.gate_layer._sample_gate_values(batch_size)
+
+            # hard-sigmoid rectification z=min(1,max(0,_z))
+            gate_values = torch.clamp(gate_values, min=0, max=1)
+
+            # use expand_as not expand/broadcast_to which do not work with torch.fx
+            input_mask = self.gate_layer.mask.expand_as(x_mlp)
+
+            # flatten all dim except batch to gather from gate values
+            flattened_mask = input_mask.reshape(batch_size, -1)
+            gate_values = torch.gather(gate_values, 1, flattened_mask)
+
+            # reshape gates(batch_size, n_elements) into input_size for point-wise mul
+            gate_values = gate_values.reshape(input_size)
+
+            prob_density = self.gate_layer._get_gate_active_probs()
+            if self.gate_layer.reg_reduction == "sum":
+                l0_reg = prob_density.sum()
+            elif self.gate_layer.reg_reduction == "mean":
+                l0_reg = prob_density.mean()
+            else:
+                l0_reg = prob_density
+
+            l0_reg *= self.gate_layer.reg_weight
+            self.l0_reg = l0_reg
+
+        # Apply the gate values
+        x_mlp_gated = gate_values * x_mlp
+        x_linear_gated = (1 - gate_values) * self.x_linear
+
+        x_gated = x_mlp_gated + x_linear_gated
+
+        return x_gated
 
 
 class MIOSTONEModel(nn.Module):
@@ -113,7 +155,8 @@ class MIOSTONEModel(nn.Module):
                  node_dim_func,
                  node_dim_func_param, 
                  node_gate_type,
-                 node_gate_param):
+                 node_gate_param,
+                 prune_mode):
         super(MIOSTONEModel, self).__init__()
         self.out_features = out_features
         self.node_min_dim = node_min_dim
@@ -121,6 +164,7 @@ class MIOSTONEModel(nn.Module):
         self.node_dim_func_param = node_dim_func_param
         self.node_gate_type = node_gate_type
         self.node_gate_param = node_gate_param
+        self.prune_mode = prune_mode
         self.hidden_layers = None
         self.output_layer = None
         self.total_l0_reg = None
@@ -201,7 +245,8 @@ class MIOSTONEModel(nn.Module):
                                   out_features, 
                                   self.node_gate_type, 
                                   self.node_gate_param, 
-                                  connections)
+                                  connections,
+                                  prune_mode=self.prune_mode)
             self.hidden_layers.append(layer)
             
         # Initialize the output layer

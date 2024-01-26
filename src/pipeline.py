@@ -1,14 +1,13 @@
 import json
 import logging
 import os
-import pickle
 from abc import ABC, abstractmethod
 
+import scanpy as sc
 import torch
-from ete4 import Tree
 from lightning.pytorch import seed_everything
+from scanpy import AnnData
 
-from baseline import MLP
 from data import MIOSTONEDataset, MIOSTONETree
 from model import MIOSTONEModel
 
@@ -30,28 +29,48 @@ class Pipeline(ABC):
     def _validate_filepath(self, filepath):
         if not os.path.exists(filepath):
             raise ValueError(f"File {filepath} does not exist.")
+        
+    def _load_tree(self, tree_fp):
+        # Validate filepath
+        self._validate_filepath(tree_fp)
 
-    def _load_data_and_tree(self, dataset, target, prune=True, preprocess=True):
-        # Define filepaths
-        data_fp = f'../data/{dataset}/data.tsv.xz'
-        meta_fp = f'../data/{dataset}/meta.tsv'
-        target_fp = f'../data/{dataset}/{target}.py'
-        tree_fp = '../data/WoL2/taxonomy.nwk'
+        # Load tree from file
+        if tree_fp.endswith('.nwk'):
+            self.tree = MIOSTONETree.init_from_nwk(tree_fp)
+        elif tree_fp.endswith('.tsv'):
+            self.tree = MIOSTONETree.init_from_tsv(tree_fp)
+        else:
+            raise ValueError(f"Invalid tree filepath: {tree_fp}")
 
+    def _load_data(self, data_fp, meta_fp, target_fp, percent_features=1.0, prune=True, preprocess=True):
         # Validate filepaths
-        for fp in [data_fp, meta_fp, target_fp, tree_fp]:
+        for fp in [data_fp, meta_fp, target_fp]:
             self._validate_filepath(fp)
 
         # Load data
-        X, y, features = MIOSTONEDataset.preprocess(data_fp, meta_fp, target_fp)
-        self.data = MIOSTONEDataset(X, y, features)
+        self.data = MIOSTONEDataset.init_from_files(data_fp, meta_fp, target_fp)
 
-        # Load tree
-        ete_tree = Tree(open(tree_fp), parser=1)
-        ete_tree.name = 'root'
+        # Create output directory if it does not exist
+        dataset_name = data_fp.split('/')[-2]
+        target_name = target_fp.split('/')[-1].split('.')[0]
+        self.output_dir = f'../output/{dataset_name}/{target_name}/'
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        if percent_features < 1.0:
+            # Reduce number of features using highly_variable_genes
+            # Convert to AnnData format for scanpy compatibility
+            adata = AnnData(self.data.X.copy())
+            adata.var_names = self.data.features
 
-        # Convert the tree to a MIOSTONETree
-        self.tree = MIOSTONETree(ete_tree)
+            # Run highly variable genes detection
+            top_features = int(percent_features * self.data.X.shape[1])
+            sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=top_features)
+            # Extract the indices of the highly variable genes
+            hvg_indices = adata.var['highly_variable'].to_numpy().nonzero()[0]
+
+            # Subset the original dataset to only include these genes
+            self.data.X = self.data.X[:, hvg_indices]
+            self.data.features = self.data.features[hvg_indices]
 
         # Prune the tree to only include the taxa in the dataset
         if prune:
@@ -68,14 +87,10 @@ class Pipeline(ABC):
         # Order the features in the dataset according to the tree
         self.data.order_features_by_tree(self.tree)
 
-        # Create output directory if it does not exist
-        self.output_dir = f'../output/{dataset}/{target}/'
-        os.makedirs(self.output_dir, exist_ok=True)
-
         # Preprocess the dataset
         if preprocess:
-            self.data.normalize()
             self.data.clr_transform()
+
 
     def _load_model(self, model_fp, results_fp):
         # Validate filepaths
@@ -89,19 +104,13 @@ class Pipeline(ABC):
             model_hparams = results['Model Hparams']
         
         # Load model
-        in_features = self.data.X.shape[1]
         out_features = self.data.num_classes
-        if model_type == 'rf':
-            self.model = pickle.load(open(model_fp, 'rb'))
+        if model_type == 'miostone':
+            self.model = MIOSTONEModel(self.tree, out_features, **model_hparams)
         else:
-            if model_type == 'mlp':
-                self.model = MLP(in_features, out_features, **model_hparams)
-            elif model_type == 'miostone':
-                self.model = MIOSTONEModel(tree=self.tree, out_features=out_features, **model_hparams)
-            else:
-                raise ValueError(f"Invalid model type: {model_type}")
+            raise ValueError(f"Invalid model type: {model_type}")
         
-            self.model.load_state_dict(torch.load(model_fp))
+        self.model.load_state_dict(torch.load(model_fp))
 
     @abstractmethod
     def _create_output_subdir(self):

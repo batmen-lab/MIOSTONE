@@ -1,11 +1,10 @@
-import copy
 import importlib
 import os
-import random
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from ete4 import Tree
+from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset
 
 
@@ -28,7 +27,19 @@ class MIOSTONETree:
         self.ete_tree = ete_tree
         self.depths = {}
         self.max_depth = 0
-        self.taxonomic_ranks = ["Life", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Strain"]
+        self.taxonomic_ranks = ["Life", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Taxa"]
+
+    @classmethod
+    def init_from_nwk(cls, nwk_file):
+        """
+        Initialize a MIOSTONETree object from a newick file.
+
+        :param nwk_file: File path to the newick file.
+        :return: A MIOSTONETree instance.
+        """
+        t = Tree(open(nwk_file), parser=1)
+        t.name = 'root'
+        return cls(t)
 
     def prune(self, features):
         """
@@ -86,16 +97,18 @@ class MIOSTONEDataset(Dataset):
         one_hot_encoded (bool): Whether the target variable is one-hot encoded.
     """
 
-    def __init__(self, X, y, features):
+    def __init__(self, X, y, ids, features):
         """
         Initialize the MIOSTONEDataset object.
 
         :param X: The input features as a numpy array.
         :param y: The target variable as a numpy array.
+        :param ids: The sample IDs as a numpy array.
         :param features: The feature names as a numpy array.
         """
         self.X = X
         self.y = y
+        self.ids = ids
         self.features = features
         self.num_classes = len(np.unique(y))
         self.class_weight = len(y) / (self.num_classes * np.bincount(y))
@@ -123,9 +136,9 @@ class MIOSTONEDataset(Dataset):
         return self.X[idx], self.y[idx]
     
     @classmethod
-    def preprocess(self, data_fp, meta_fp, target_fp):
+    def init_from_files(cls, data_fp, meta_fp, target_fp):
         """
-        Preprocess the dataset from given file paths.
+        Initialize a MIOSTONEDataset object from files.
 
         :param data_fp: File path to the MIOSTONE data.
         :param meta_fp: File path to the metadata.
@@ -155,9 +168,10 @@ class MIOSTONEDataset(Dataset):
         # input data
         X = data.values.T.astype(np.float32)
         y = prop.values
+        ids = np.array(ids)
         features = data.index.values
 
-        return X, y, features
+        return cls(X, y, ids, features)
     
     def normalize(self):
         """
@@ -168,7 +182,6 @@ class MIOSTONEDataset(Dataset):
         """
         if self.normalized:
             raise ValueError("Dataset is already normalized")
-        self.X = self.X + 1 # Add a small value to avoid division by zero
         self.X_sum = self.X.sum(axis=1, keepdims=True)
         self.X = self.X / self.X_sum
         self.normalized = True 
@@ -192,27 +205,6 @@ class MIOSTONEDataset(Dataset):
         self.X = self.X - self.X.mean(axis=1, keepdims=True)
 
         self.clr_transformed = True
-
-    def standardize(self, scaler=None):
-        """
-        Standardize the dataset by subtracting the mean and dividing by the standard deviation.
-
-        :param scaler: A Scaler instance to apply to the dataset. Defaults to None.
-        :return: A Scaler instance used to scale the dataset.
-        :raises ValueError: If the dataset is already standardized or not CLR transformed.
-        """
-        if self.standardized:
-            raise ValueError("Dataset is already standardized")
-        if not self.clr_transformed:
-            raise ValueError("Dataset must be clr-transformed before standardizing")
-        if scaler:
-            self.X = scaler.transform(X=self.X)
-        else:
-            scaler = StandardScaler()
-            self.X = scaler.fit_transform(X=self.X, y=self.y)
-
-        self.standardized = True
-        return scaler
 
     def one_hot_encode(self):
         """
@@ -311,19 +303,19 @@ class MIOSTONEDataset(Dataset):
         self.X = self.X[:, [self.features.tolist().index(leaf) for leaf in leaf_names]]
         self.features = np.array(leaf_names)
 
-    def to_tree_matrix(self, tree, scaler=None):
+    def to_popphycnn_matrix(self, tree, scaler=None):
         """
-        Convert the dataset to a tree matrix representation. 
+        Convert the dataset to a PopPhyCNN matrix representation.
 
         :param tree: A MIOSTONETree instance.
         :param scaler: A Scaler instance to apply to the matrix. Defaults to None.
         :return: A Scaler instance used to scale the matrix.
-        :raises ValueError: If the dataset is already in tree matrix representation or is CLR transformed.
+        :raises ValueError: If the dataset is already in PopPhyCNN matrix representation or if the dataset is CLR transformed.
         """
         if self.tree_matrix_repr:
-            raise ValueError("Dataset is already in tree matrix representation")
+            raise ValueError("Dataset is already in PopPhyCNN matrix representation")
         if self.clr_transformed:
-            raise ValueError("Dataset must not be clr-transformed before converting to tree matrix representation")
+            raise ValueError("Dataset must not be clr-transformed before converting to PopPhyCNN matrix representation")
 
         # Create a matrix with the same shape as the tree
         num_rows = tree.max_depth + 1
