@@ -3,7 +3,7 @@ Source code for **MIOSTONE: Modeling microbiome-trait associations with taxonomy
 
 ## Dataset
 
-Please unzip the `data.tat.xz` file and put the `data` directory in the same directory as the `src` directory.
+Please unzip the `data.tar.xz` file and put the `data` directory in the same directory as the `src` directory.
 
 ## Example Notebook
 
