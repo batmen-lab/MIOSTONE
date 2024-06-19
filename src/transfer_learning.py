@@ -92,11 +92,15 @@ class TransferLearningPipeline(TrainingPipeline):
 
         # Run training
         filename = f"{self.seed}_pretrain_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self._run_training(classifier, train_dataset, train_dataset, train_dataset, filename)
+        result = self._run_training(classifier, train_dataset, train_dataset, train_dataset, filename)
+
+        # Save the model
+        self._save_result(result, self.pred_dir, filename)
+        self._save_model(classifier, self.model_dir, filename)
 
         # Set the model to the trained model
         self.model = classifier if self.model_type in ['rf', 'lr', 'svm'] else classifier.model
-
+        
         # Reset the seed
         seed_everything(self.seed, workers=True)
 
@@ -180,4 +184,4 @@ if __name__ == '__main__':
     parser.add_argument('--num_frozen_layers', type=int, default=7, help='Number of layers to freeze.')
     args = parser.parse_args()
 
-    run_transfer_learning_pipeline(args.dataset, args.pretrain_dataset, args.target, args.model_type, args.num_epochs, args.num_frozen_layers, args.seed)
+    run_transfer_learning_pipeline(args.dataset, args.pretrain_dataset, args.target, args.model_type, args.seed, args.num_epochs, args.num_frozen_layers)

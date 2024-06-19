@@ -10,6 +10,7 @@ from scanpy import AnnData
 
 from data import MIOSTONEDataset, MIOSTONETree
 from model import MIOSTONEModel
+from baseline import MLP, PopPhyCNN, TaxoNN
 
 
 class Pipeline(ABC):
@@ -100,17 +101,25 @@ class Pipeline(ABC):
         # Load model hyperparameters
         with open(results_fp) as f:
             results = json.load(f)
-            model_type = results['Model Type']
+            self.model_type = results['Model Type']
             model_hparams = results['Model Hparams']
         
         # Load model
+        in_features = self.data.X.shape[1]
         out_features = self.data.num_classes
-        if model_type == 'miostone':
-            self.model = MIOSTONEModel(self.tree, out_features, **model_hparams)
+        if self.model_type == 'taxonn':
+            self.model = torch.load(model_fp)
         else:
-            raise ValueError(f"Invalid model type: {model_type}")
-        
-        self.model.load_state_dict(torch.load(model_fp))
+            if self.model_type == 'miostone':
+                self.model = MIOSTONEModel(self.tree, out_features, **model_hparams)
+            elif self.model_type == 'mlp':
+                self.model = MLP(in_features, out_features, **model_hparams)
+            elif self.model_type == 'popphycnn':
+                self.model = PopPhyCNN(self.tree, out_features, **model_hparams)
+            else:
+                raise ValueError(f"Invalid model type: {self.model_type}")
+            
+            self.model.load_state_dict(torch.load(model_fp))
 
     @abstractmethod
     def _create_output_subdir(self):

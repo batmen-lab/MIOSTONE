@@ -16,12 +16,14 @@ from sklearn.model_selection import KFold
 from sklearn.svm import SVC
 from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
-from torchmetrics.classification import (MulticlassAUROC, MulticlassAveragePrecision)
+from torchmetrics.classification import (MulticlassAUROC,
+                                         MulticlassAveragePrecision)
 
 from baseline import MLP, PopPhyCNN, TaxoNN
 from data import MIOSTONEDataset
 from model import MIOSTONEModel
 from pipeline import Pipeline
+from treenn import TreeNN
 
 
 class DataModule(LightningDataModule):
@@ -170,6 +172,8 @@ class TrainingPipeline(Pipeline):
                 model = PopPhyCNN(self.tree, out_features, **self.model_hparams)
             elif self.model_type == 'miostone':
                 model = MIOSTONEModel(self.tree, out_features, **self.model_hparams)
+            elif self.model_type == 'treenn':
+                model = TreeNN(device='cpu', tree=self.tree, **self.model_hparams)
             else:
                 raise ValueError(f"Invalid model type: {self.model_type}")
     
@@ -230,6 +234,8 @@ class TrainingPipeline(Pipeline):
     def _save_model(self, classifier, save_dir, filename):
         if self.model_type in ['rf', 'svm']:
             pickle.dump(classifier, open(save_dir + filename + '.pkl', 'wb'))
+        elif self.model_type == 'taxonn':
+            torch.save(classifier.model, save_dir + filename + '.pt')
         else:
             torch.save(classifier.model.state_dict(), save_dir + filename + '.pt')
     
@@ -333,6 +339,7 @@ class TrainingPipeline(Pipeline):
             'meta': f'../data/{dataset}/meta.tsv',
             'target': f'../data/{dataset}/{target}.py',
             'tree': '../data/WoL2/taxonomy.nwk' if not dataset.endswith('_ncbi') else '../data/WoL2/taxonomy_ncbi.nwk'
+            # 'tree': '../data/WoL2/phylogeny.nwk'
         }
 
         # Load tree
@@ -361,12 +368,22 @@ class TrainingPipeline(Pipeline):
             self.model_hparams['num_cnn_layers'] = 1
             self.model_hparams['num_fc_layers'] = 1
             self.model_hparams['dropout'] = 0.3
+        elif self.model_type == 'treenn':
+            self.model_hparams['node_min_dim'] = 1
+            self.model_hparams['node_dim_func'] = 'linear'
+            self.model_hparams['node_dim_func_param'] = 0.6
+            self.model_hparams['node_gate_type'] = 'concrete'
+            self.model_hparams['node_gate_param'] = 0.3
+            self.model_hparams['output_dim'] = 2
+            self.model_hparams['output_depth'] = 0
+            self.model_hparams['output_truncation'] = False
 
         # Configure default training parameters
         self.train_hparams['k_folds'] = 5
         self.train_hparams['batch_size'] = 512
         self.train_hparams['max_epochs'] = 200
         self.train_hparams['class_weight'] = 'balanced'
+        # self.train_hparams['percent_features'] = kwargs.get('percent_features', 1)
         
         # Train the model
         self._train()
@@ -380,7 +397,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, required=True, help="Random seed.")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset to use.")
     parser.add_argument("--target", type=str, required=True, help="Target to predict.")
-    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'svm', 'mlp', 'taxonn', 'popphycnn', 'miostone'], help="Model type to use.")
+    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'svm', 'mlp', 'taxonn', 'popphycnn', 'miostone', 'treenn'], help="Model type to use.")
+    # parser.add_argument("--percent_features", type=float, default=1, help="Percentage of features to use.")
     args = parser.parse_args()
 
     run_training_pipeline(args.dataset, args.target, args.model_type, args.seed)

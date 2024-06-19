@@ -82,7 +82,6 @@ class MIOSTONETree:
             self.indices[ete_node.name] = curr_id
             curr_id += 1
 
-
 class MIOSTONEDataset(Dataset):
     """
     A class to handle MIOSTONE datasets, offering functionality for preprocessing, 
