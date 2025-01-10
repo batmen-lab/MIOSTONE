@@ -20,9 +20,8 @@ class TransferLearningPipeline(TrainingPipeline):
 
     def _create_output_subdir(self):
         super()._create_output_subdir()
-        self.pred_dir = self.pred_dir + 'transfer_learning/'
-        if not os.path.exists(self.pred_dir):
-            os.makedirs(self.pred_dir)
+        self.pred_dir = os.path.join(self.pred_dir, 'transfer_learning')
+        os.makedirs(self.pred_dir, exist_ok=True)
 
     def _load_pretain_data(self, data_fp, meta_fp, target_fp, drop_features=True):
         # Validate filepaths
@@ -94,10 +93,6 @@ class TransferLearningPipeline(TrainingPipeline):
         filename = f"{self.seed}_pretrain_{self.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         result = self._run_training(classifier, train_dataset, train_dataset, train_dataset, filename)
 
-        # Save the model
-        self._save_result(result, self.pred_dir, filename)
-        self._save_model(classifier, self.model_dir, filename)
-
         # Set the model to the trained model
         self.model = classifier if self.model_type in ['rf', 'lr', 'svm'] else classifier.model
         
@@ -139,6 +134,16 @@ class TransferLearningPipeline(TrainingPipeline):
             self.model_hparams['num_cnn_layers'] = 1
             self.model_hparams['num_fc_layers'] = 1
             self.model_hparams['dropout'] = 0.3
+        elif self.model_type == 'deepbiome':
+            self.model_hparams['batch_norm'] = False
+            self.model_hparams['dropout'] = 0
+            self.model_hparams['weight_decay_type'] = 'phylogenetic_tree'
+            self.model_hparams['weight_initial'] = 'xavier_uniform'
+        elif self.model_type == 'mdeep':
+            self.model_hparams['num_filter'] = (64, 64, 32)
+            self.model_hparams['window_size'] = (8, 8, 8)
+            self.model_hparams['stride_size'] = (4, 4, 4)
+            self.model_hparams['keep_prob'] = 0.5
 
         # Configure default training parameters
         self.train_hparams['k_folds'] = 5
@@ -161,7 +166,7 @@ class TransferLearningPipeline(TrainingPipeline):
             self._pretrain()
 
         # Configure default fine-tuning parameters
-        self.train_hparams['max_epochs'] = 200
+        self.train_hparams['max_epochs'] = 0
         self.train_hparams['class_weight'] = 'balanced'
         if self.model_type == 'miostone':
             self.train_hparams['num_frozen_layers'] = num_frozen_layers
@@ -179,7 +184,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, required=True, help='Dataset to use for fine-tuning.')
     parser.add_argument('--pretrain_dataset', type=str, required=True, help='Dataset to use for pretraining.')
     parser.add_argument('--target', type=str, required=True, help='Target to predict.')
-    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'mlp', 'svm', 'popphycnn', 'taxonn', 'miostone'], help="Model type to use.")
+    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'mlp', 'svm', 'deepbiome', 'popphycnn', 'taxonn', 'mdeep', 'miostone'], help="Model type to use.")
     parser.add_argument('--num_epochs', type=int, default=25, help='Number of epochs to pretrain for.')
     parser.add_argument('--num_frozen_layers', type=int, default=7, help='Number of layers to freeze.')
     args = parser.parse_args()

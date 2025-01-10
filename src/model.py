@@ -1,9 +1,12 @@
 import random
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-from captum.module import BinaryConcreteStochasticGates, GaussianStochasticGates
+from captum.module import (BinaryConcreteStochasticGates,
+                           GaussianStochasticGates)
+
 
 class MIOSTONELayer(nn.Module):
     def __init__(self, 
@@ -191,7 +194,6 @@ class MIOSTONEModel(nn.Module):
         curr_index = 0
         curr_depth = tree.max_depth
         prev_layer_out_features = 0
-
         for ete_node in reversed(list(tree.ete_tree.traverse("levelorder"))):
             node_depth = tree.depths[ete_node.name]
             if node_depth != curr_depth:

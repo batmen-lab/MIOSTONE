@@ -39,6 +39,11 @@ class MIOSTONETree:
         """
         t = Tree(open(nwk_file), parser=1)
         t.name = 'root'
+        for node in t.traverse():
+            if node.is_root:    
+                node.dist = 0
+            else:
+                node.dist = 1
         return cls(t)
 
     def prune(self, features):
@@ -63,8 +68,6 @@ class MIOSTONETree:
                 self.depths[ete_node.name] = 0
             else:
                 self.depths[ete_node.name] = self.depths[ete_node.up.name] + 1
-            if self.depths[ete_node.name] == 2 and ete_node.is_leaf:
-                print(ete_node.up.up.name)
             self.max_depth = max(self.max_depth, self.depths[ete_node.name])
 
     def compute_indices(self):
@@ -344,3 +347,29 @@ class MIOSTONEDataset(Dataset):
         self.tree_matrix_repr = True
 
         return scaler
+    
+    def to_concat_hierarchy_vector(self, tree):
+        """
+        Convert the dataset to a concatenated hierarchy vector representation.
+
+        :param tree: A MIOSTONETree instance.
+        """
+        num_rows = tree.max_depth + 1
+        num_cols = len(list(tree.ete_tree.leaves()))
+        M = np.zeros((self.X.shape[0], num_rows, num_cols), dtype=np.float32)
+
+        # Iterate over the nodes in the tree in level order and fill in the matrix
+        for ete_node in reversed(list(tree.ete_tree.traverse("levelorder"))):
+            if ete_node.is_leaf:
+                M[:, tree.depths[ete_node.name], tree.indices[ete_node.name]] = self.X[:, tree.indices[ete_node.name]]
+            else:
+                for child in ete_node.get_children():
+                    M[:, tree.depths[ete_node.name], tree.indices[ete_node.name]] += M[:, tree.depths[child.name], tree.indices[child.name]]
+                M[:, tree.depths[ete_node.name], tree.indices[ete_node.name]] /= len(ete_node.get_children())
+
+        lengths = {i: 0 for i in range(num_rows)}
+        for _, depth in tree.depths.items():
+            lengths[depth] += 1
+
+        vectors = [M[:, i, :lengths[i]] for i in range(num_rows)]
+        self.X = np.concatenate(vectors, axis=1)

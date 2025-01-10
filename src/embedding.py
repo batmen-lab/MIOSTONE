@@ -29,7 +29,7 @@ class EmbeddingPipeline(Pipeline):
             raise RuntimeError("Model and data must be loaded before capturing embeddings.")
         
         # Validate that the model is an instance of mlp, popphy, taxonn, or miostone
-        if self.model_type not in ['mlp', 'popphycnn', 'taxonn', 'miostone']:
+        if self.model_type not in ['mlp', 'deepbiome', 'phcnn', 'popphycnn', 'taxonn', 'mdeep', 'miostone']:
             raise ValueError(f"Invalid model type: {self.model_type}")
 
         # Register hooks to capture embeddings from each layer
@@ -39,12 +39,12 @@ class EmbeddingPipeline(Pipeline):
         if self.model_type == 'miostone':
             self.data.clr_transform()
             self.embeddings = {self.tree.max_depth: self.data.X}
-        elif self.model_type in ['mlp', 'taxonn']:
+        elif self.model_type in ['mlp', 'taxonn', 'deepbiome', 'phcnn', 'mdeep']:
             self.data.clr_transform()
             self.embeddings = {1: self.data.X}
         elif self.model_type == 'popphycnn':
             self.data.to_popphycnn_matrix(self.tree)
-            self.embeddings = {2: self.data.X}
+            self.embeddings = {1: self.data.X}
 
         # Perform a forward pass through the model to capture embeddings            
         self.model.eval()
@@ -59,10 +59,15 @@ class EmbeddingPipeline(Pipeline):
         elif self.model_type == 'mlp':
             self.model.fc1._forward_hooks.clear()
         elif self.model_type == 'popphycnn':
-            self.model.cnn_layers._forward_hooks.clear()
             self.model.fc_layers._forward_hooks.clear()
         elif self.model_type == 'taxonn':
             self.model.output_layer._forward_hooks.clear()
+        elif self.model_type == 'deepbiome':
+            self.model.layers[-1]._forward_hooks.clear()
+        elif self.model_type == 'phcnn':
+            self.model.dense1._forward_hooks.clear()
+        elif self.model_type == 'mdeep':
+            self.model.fc_layers[0]._forward_hooks.clear()
 
 
     def _register_hooks(self):
@@ -82,11 +87,20 @@ class EmbeddingPipeline(Pipeline):
             self.model.fc_layers.register_forward_hook(
                 lambda module, input, output: hook_function(module, input, output, 0)
             )
-            self.model.cnn_layers.register_forward_hook(
-                lambda module, input, output: hook_function(module, input, output, 1)
-            )
         elif self.model_type == 'taxonn':
             self.model.output_layer.register_forward_hook(
+                lambda module, input, output: hook_function(module, input, output, 0)
+            )
+        elif self.model_type == 'deepbiome':
+            self.model.layers[-1].register_forward_hook(
+                lambda module, input, output: hook_function(module, input, output, 0)
+            )
+        elif self.model_type == 'phcnn':
+            self.model.dense1.register_forward_hook(
+                lambda module, input, output: hook_function(module, input, output, 0)
+            )
+        elif self.model_type == 'mdeep':
+            self.model.fc_layers[0].register_forward_hook(
                 lambda module, input, output: hook_function(module, input, output, 0)
             )
 
@@ -98,11 +112,20 @@ class EmbeddingPipeline(Pipeline):
             depths = range(0, 2)
             titles = ['fc1', 'input']
         elif self.model_type == 'popphycnn':
-            depths = range(0, 3)
-            titles = ['fc', 'cnn', 'input']
+            depths = range(0, 2)
+            titles = ['fc', 'input']
         elif self.model_type == 'taxonn':
             depths = range(0, 2)
             titles = ['cnn', 'input']
+        elif self.model_type == 'deepbiome':
+            depths = range(0, 2)
+            titles = ['layers', 'input']
+        elif self.model_type == 'phcnn':
+            depths = range(0, 2)
+            titles = ['dense1', 'input']
+        elif self.model_type == 'mdeep':
+            depths = range(0, 2)
+            titles = ['fc', 'input']
 
         labels = np.unique(self.data.y)
         n_plots = len(depths)
@@ -136,8 +159,7 @@ class EmbeddingPipeline(Pipeline):
         fig.legend([label_mapping[label] for label in labels], loc='center', ncol=2)
 
         plt.tight_layout()
-        plt.savefig(f"{self.embedding_dir}/{self.model_type}_{reducer}.png")
-        plt.show()
+        plt.savefig(f"{self.embedding_dir}/{self.model_type}_{reducer}.pdf")
 
     def _plot_embeddings_with_labels(self, reduced_embeddings, labels, ax):
         for label in labels:

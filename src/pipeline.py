@@ -8,9 +8,9 @@ import torch
 from lightning.pytorch import seed_everything
 from scanpy import AnnData
 
+from baseline import MLP, PopPhyCNN, TaxoNN, MDeep, DeepBiome, PhCNN
 from data import MIOSTONEDataset, MIOSTONETree
 from model import MIOSTONEModel
-from baseline import MLP, PopPhyCNN, TaxoNN
 
 
 class Pipeline(ABC):
@@ -116,6 +116,12 @@ class Pipeline(ABC):
                 self.model = MLP(in_features, out_features, **model_hparams)
             elif self.model_type == 'popphycnn':
                 self.model = PopPhyCNN(self.tree, out_features, **model_hparams)
+            elif self.model_type == 'mdeep':
+                self.model = MDeep(self.tree, out_features, **model_hparams)
+            elif self.model_type == 'deepbiome':
+                self.model = DeepBiome(self.tree, out_features, **model_hparams)
+            elif self.model_type == 'phcnn':
+                self.model = PhCNN(self.tree, out_features, **model_hparams)
             else:
                 raise ValueError(f"Invalid model type: {self.model_type}")
             

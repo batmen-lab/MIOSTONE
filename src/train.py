@@ -5,6 +5,7 @@ import pickle
 import time
 from datetime import datetime
 
+import cupy as cp
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,8 +19,10 @@ from torch.utils.data import DataLoader
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (MulticlassAUROC,
                                          MulticlassAveragePrecision)
+from xgboost import XGBClassifier
 
-from baseline import MLP, PopPhyCNN, TaxoNN
+from baseline import (MLP, DeepBiome, MDeep, MLPWithTree, PhCNN, PopPhyCNN,
+                      TaxoNN)
 from data import MIOSTONEDataset
 from model import MIOSTONEModel
 from pipeline import Pipeline
@@ -67,16 +70,17 @@ class Classifier(LightningModule):
         X, y = batch
         logits = self.model(X)
         loss = self.train_criterion(logits, y)
-        l0_reg = self.model.get_total_l0_reg()
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=False)
+        if isinstance(self.model, MIOSTONEModel):
+            l0_reg = self.model.get_total_l0_reg()
+            loss += l0_reg
     
-        return loss + l0_reg
+        return loss
 
     def validation_step(self, batch, batch_idx):
         X, y = batch
         logits = self.model(X)
         loss = self.val_criterion(logits, y)
-        l0_reg = self.model.get_total_l0_reg()
         self.validation_step_outputs.append({'logits': logits, 'labels': y})
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=False, logger=False)
 
@@ -86,7 +90,7 @@ class Classifier(LightningModule):
         for key, value in scores.items():
             self.log(f'val_{key}', value, on_step=False, on_epoch=True, prog_bar=False, logger=False)
 
-        return loss + l0_reg
+        return loss
     
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
@@ -129,14 +133,13 @@ class TrainingPipeline(Pipeline):
         self.model_hparams = {}
         self.train_hparams = {}
         self.mixup_hparams = {}
-        self.output_subdir = None
+        self.output_dir = None
 
     def _create_output_subdir(self):
-        self.pred_dir = self.output_dir + 'predictions/'
-        self.model_dir = self.output_dir + 'models/'
-        for dir in [self.pred_dir, self.model_dir]:
-            if not os.path.exists(dir):
-                os.makedirs(dir)
+        self.pred_dir = os.path.join(self.output_dir, 'predictions')
+        self.model_dir = os.path.join(self.output_dir, 'models')
+        os.makedirs(self.pred_dir, exist_ok=True)
+        os.makedirs(self.model_dir, exist_ok=True)
 
     def _create_subset(self, data, indices, normalize=True, one_hot_encoding=True, clr=True):
         X_subset = data.X[indices]
@@ -156,20 +159,32 @@ class TrainingPipeline(Pipeline):
         out_features = train_dataset.num_classes
         class_weight = train_dataset.class_weight if self.train_hparams['class_weight'] == 'balanced' else [1] * out_features
 
-        if self.model_type in ['rf', 'svm']:
+        if self.model_type in ['rf', 'svm', 'xgb']:
             class_weight = {key: value for key, value in enumerate(class_weight)}
             if self.model_type == 'rf':
                 classifier = RandomForestClassifier(class_weight=class_weight, random_state=self.seed)
             elif self.model_type == 'svm':
                 classifier = SVC(kernel='linear', probability=True, class_weight=class_weight, random_state=self.seed)
+            elif self.model_type == 'xgb':
+                classifier = XGBClassifier(scale_pos_weight=class_weight[1], 
+                                           device='cuda' if torch.cuda.is_available() else 'cpu',
+                                           random_state=self.seed)
         else:
             class_weight = torch.tensor(class_weight).float()
             if self.model_type == 'mlp':
                 model = MLP(in_features, out_features, **self.model_hparams)
+            elif self.model_type == 'mlpwithtree':
+                model = MLPWithTree(self.tree, out_features, **self.model_hparams)
             elif self.model_type == 'taxonn':
                 model = TaxoNN(self.tree, out_features, train_dataset, **self.model_hparams)
             elif self.model_type == 'popphycnn':
                 model = PopPhyCNN(self.tree, out_features, **self.model_hparams)
+            elif self.model_type == 'mdeep':
+                model = MDeep(self.tree, out_features, **self.model_hparams)
+            elif self.model_type == 'deepbiome':
+                model = DeepBiome(self.tree, out_features, **self.model_hparams)
+            elif self.model_type == 'phcnn':
+                model = PhCNN(self.tree, out_features, **self.model_hparams)
             elif self.model_type == 'miostone':
                 model = MIOSTONEModel(self.tree, out_features, **self.model_hparams)
             elif self.model_type == 'treenn':
@@ -226,21 +241,25 @@ class TrainingPipeline(Pipeline):
         }
 
     def _run_training(self, classifier, train_dataset, val_dataset, test_dataset, filename):
-        if self.model_type in ['rf', 'svm']:
+        if self.model_type in ['rf', 'svm', 'xgb']:
             return self._run_sklearn_training(classifier, train_dataset, test_dataset)
         else:
             return self._run_pytorch_training(classifier, train_dataset, val_dataset, test_dataset, filename)
     
     def _save_model(self, classifier, save_dir, filename):
-        if self.model_type in ['rf', 'svm']:
-            pickle.dump(classifier, open(save_dir + filename + '.pkl', 'wb'))
-        elif self.model_type == 'taxonn':
-            torch.save(classifier.model, save_dir + filename + '.pt')
+        if self.model_type in ['rf', 'svm', 'xgb']:
+            file_path = os.path.join(save_dir, filename + '.pkl')
+            pickle.dump(classifier, open(file_path, 'wb'))
         else:
-            torch.save(classifier.model.state_dict(), save_dir + filename + '.pt')
+            file_path = os.path.join(save_dir, filename + '.pt')
+            if self.model_type == 'taxonn':
+                torch.save(classifier.model, file_path)
+            else:
+                torch.save(classifier.model.state_dict(), file_path)
     
     def _save_result(self, result, save_dir, filename):
-        with open(save_dir + filename + '.json', 'w') as f:
+        file_path = os.path.join(save_dir, filename + '.json')
+        with open(file_path, 'w') as f:
             result_to_save = {
                 'Seed': self.seed,
                 'Fold': filename.split('_')[1],
@@ -252,7 +271,7 @@ class TrainingPipeline(Pipeline):
                 'Test Logits': result['test_logits'],
                 'Time Elapsed': result['time_elapsed']
             }
-            if self.model_type not in ['rf', 'svm']:
+            if self.model_type not in ['rf', 'svm', 'xgb']:
                 result_to_save['Epoch Val Labels'] = result['epoch_val_labels']
                 result_to_save['Epoch Val Logits'] = result['epoch_val_logits']
             json.dump(result_to_save, f, indent=4)
@@ -278,7 +297,7 @@ class TrainingPipeline(Pipeline):
         for fold, (train_index, test_index) in enumerate(kf.split(self.data.X, self.data.y)):
             # Prepare datasets
             normalize = True if self.model_type == 'popphycnn' else False
-            clr = False if self.model_type == 'popphycnn' else True
+            clr = False if self.model_type == 'popphycnn' or self.model_type == 'xgb' else True
             train_dataset = self._create_subset(self.data, 
                                                 train_index, 
                                                 normalize=normalize,
@@ -297,6 +316,13 @@ class TrainingPipeline(Pipeline):
             if self.model_type == 'popphycnn':
                 scaler = train_dataset.to_popphycnn_matrix(self.tree)
                 test_dataset.to_popphycnn_matrix(self.tree, scaler=scaler)
+            elif self.model_type in ['xgb', 'rf', 'svm'] and self.model_hparams['concat_hierarchy'] is True:
+                train_dataset.to_concat_hierarchy_vector(self.tree)
+                test_dataset.to_concat_hierarchy_vector(self.tree)
+
+            if self.model_type == 'xgb' and torch.cuda.is_available():
+                train_dataset.X = cp.array(train_dataset.X)
+                test_dataset.X = cp.array(test_dataset.X)
 
             # Set filename
             filename = f"{self.seed}_{fold}_{self.model_type}"
@@ -304,8 +330,12 @@ class TrainingPipeline(Pipeline):
                 filename += f"_{self.model_hparams['node_gate_type']}{self.model_hparams['node_gate_param']}"
                 filename += f"_{self.model_hparams['node_dim_func']}{self.model_hparams['node_dim_func_param']}"
                 filename += f"_{self.model_hparams['prune_mode']}"
+            if self.model_type in ['rf', 'svm', 'xgb']:
+                filename += f"_ch" if self.model_hparams['concat_hierarchy'] else ""
             if "percent_features" in self.train_hparams:
                 filename += f"_p{self.train_hparams['percent_features']}"
+            if 'taxonomy' in self.train_hparams:
+                filename += f"_{self.train_hparams['taxonomy']}"
             if "num_frozen_layers" in self.train_hparams:
                 filename += f"_frozen{self.train_hparams['num_frozen_layers']}"
             if "pretrain_num_epochs" in self.train_hparams:
@@ -323,6 +353,7 @@ class TrainingPipeline(Pipeline):
             self._save_result(result, self.pred_dir, filename)
             self._save_model(classifier, self.model_dir, filename)
 
+
         # Calculate metrics
         test_labels = torch.cat(fold_test_labels, dim=0)
         test_logits = torch.cat(fold_test_logits, dim=0)
@@ -338,7 +369,7 @@ class TrainingPipeline(Pipeline):
             'data': f'../data/{dataset}/data.tsv.xz',
             'meta': f'../data/{dataset}/meta.tsv',
             'target': f'../data/{dataset}/{target}.py',
-            'tree': '../data/WoL2/taxonomy.nwk' if not dataset.endswith('_ncbi') else '../data/WoL2/taxonomy_ncbi.nwk'
+            'tree': '../data/WoL2/deepbiome.nwk' if dataset.startswith('deepbiome') else '../data/WoL2/taxonomy.nwk'
             # 'tree': '../data/WoL2/phylogeny.nwk'
         }
 
@@ -368,6 +399,19 @@ class TrainingPipeline(Pipeline):
             self.model_hparams['num_cnn_layers'] = 1
             self.model_hparams['num_fc_layers'] = 1
             self.model_hparams['dropout'] = 0.3
+        elif self.model_type == 'phcnn':
+            self.model_hparams['nb_neighbors'] = (4, 4)
+            self.model_hparams['nb_filters'] = (16, 16)
+        elif self.model_type == 'deepbiome':
+            self.model_hparams['batch_norm'] = False
+            self.model_hparams['dropout'] = 0
+            self.model_hparams['weight_decay_type'] = 'phylogenetic_tree'
+            self.model_hparams['weight_initial'] = 'xavier_uniform'
+        elif self.model_type == 'mdeep':
+            self.model_hparams['num_filter'] = (64, 64, 32)
+            self.model_hparams['window_size'] = (8, 8, 8)
+            self.model_hparams['stride_size'] = (4, 4, 4)
+            self.model_hparams['keep_prob'] = 0.5
         elif self.model_type == 'treenn':
             self.model_hparams['node_min_dim'] = 1
             self.model_hparams['node_dim_func'] = 'linear'
@@ -377,6 +421,8 @@ class TrainingPipeline(Pipeline):
             self.model_hparams['output_dim'] = 2
             self.model_hparams['output_depth'] = 0
             self.model_hparams['output_truncation'] = False
+        elif self.model_type in ['rf', 'svm', 'xgb']:
+            self.model_hparams['concat_hierarchy'] = False
 
         # Configure default training parameters
         self.train_hparams['k_folds'] = 5
@@ -384,6 +430,7 @@ class TrainingPipeline(Pipeline):
         self.train_hparams['max_epochs'] = 200
         self.train_hparams['class_weight'] = 'balanced'
         # self.train_hparams['percent_features'] = kwargs.get('percent_features', 1)
+        # self.train_hparams['taxonomy'] = 'ncbi'
         
         # Train the model
         self._train()
@@ -397,7 +444,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, required=True, help="Random seed.")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset to use.")
     parser.add_argument("--target", type=str, required=True, help="Target to predict.")
-    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'svm', 'mlp', 'taxonn', 'popphycnn', 'miostone', 'treenn'], help="Model type to use.")
+    parser.add_argument("--model_type", type=str, required=True, choices=['rf', 'svm', 'mlp', 'mlpwithtree', 'xgb', 'taxonn', 'popphycnn', 'phcnn', 'deepbiome', 'mdeep', 'miostone', 'treenn'], help="Model type to use.")
     # parser.add_argument("--percent_features", type=float, default=1, help="Percentage of features to use.")
     args = parser.parse_args()
 
